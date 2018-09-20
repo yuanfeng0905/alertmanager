@@ -32,7 +32,8 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/alertmanager/api"
+	apiv1 "github.com/prometheus/alertmanager/api/v1"
+	apiv2 "github.com/prometheus/alertmanager/api/v2"
 	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
@@ -49,7 +50,6 @@ import (
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/common/version"
-	"github.com/prometheus/prometheus/pkg/labels"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -156,7 +156,12 @@ func main() {
 		peerTimeout          = kingpin.Flag("cluster.peer-timeout", "Time to wait between peers to send notifications.").Default("15s").Duration()
 		gossipInterval       = kingpin.Flag("cluster.gossip-interval", "Interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").Default(cluster.DefaultGossipInterval.String()).Duration()
 		pushPullInterval     = kingpin.Flag("cluster.pushpull-interval", "Interval for gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+		tcpTimeout           = kingpin.Flag("cluster.tcp-timeout", "Timeout for establishing a stream connection with a remote node for a full state sync, and for stream read and write operations.").Default(cluster.DefaultTcpTimeout.String()).Duration()
+		probeTimeout         = kingpin.Flag("cluster.probe-timeout", "Timeout to wait for an ack from a probed node before assuming it is unhealthy. This should be set to 99-percentile of RTT (round-trip time) on your network.").Default(cluster.DefaultProbeTimeout.String()).Duration()
+		probeInterval        = kingpin.Flag("cluster.probe-interval", "Interval between random node probes. Setting this lower (more frequent) will cause the cluster to detect failed nodes more quickly at the expense of increased bandwidth usage.").Default(cluster.DefaultProbeInterval.String()).Duration()
 		settleTimeout        = kingpin.Flag("cluster.settle-timeout", "Maximum time to wait for cluster connections to settle before evaluating notifications.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+		reconnectInterval    = kingpin.Flag("cluster.reconnect-interval", "Interval between attempting to reconnect to lost peers.").Default(cluster.DefaultReconnectInterval.String()).Duration()
+		peerReconnectTimeout = kingpin.Flag("cluster.reconnect-timeout", "Length of time to attempt to reconnect to a lost peer.").Default(cluster.DefaultReconnectTimeout.String()).Duration()
 	)
 
 	kingpin.Version(version.Print("alertmanager"))
@@ -177,24 +182,23 @@ func main() {
 
 	var peer *cluster.Peer
 	if *clusterBindAddr != "" {
-		peer, err = cluster.Join(log.With(logger, "component", "cluster"), prometheus.DefaultRegisterer,
+		peer, err = cluster.Create(
+			log.With(logger, "component", "cluster"),
+			prometheus.DefaultRegisterer,
 			*clusterBindAddr,
 			*clusterAdvertiseAddr,
 			*peers,
 			true,
 			*pushPullInterval,
 			*gossipInterval,
+			*tcpTimeout,
+			*probeTimeout,
+			*probeInterval,
 		)
 		if err != nil {
-			level.Error(logger).Log("msg", "Unable to initialize gossip mesh", "err", err)
+			level.Error(logger).Log("msg", "unable to initialize gossip mesh", "err", err)
 			os.Exit(1)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), *settleTimeout)
-		defer func() {
-			cancel()
-			peer.Leave(10 * time.Second)
-		}()
-		go peer.Settle(ctx, *gossipInterval*10)
 	}
 
 	stopc := make(chan struct{})
@@ -215,7 +219,7 @@ func main() {
 		os.Exit(1)
 	}
 	if peer != nil {
-		c := peer.AddState("nfl", notificationLog)
+		c := peer.AddState("nfl", notificationLog, prometheus.DefaultRegisterer)
 		notificationLog.SetBroadcast(c.Broadcast)
 	}
 
@@ -235,7 +239,7 @@ func main() {
 		os.Exit(1)
 	}
 	if peer != nil {
-		c := peer.AddState("sil", silences)
+		c := peer.AddState("sil", silences, prometheus.DefaultRegisterer)
 		silences.SetBroadcast(c.Broadcast)
 	}
 
@@ -251,7 +255,26 @@ func main() {
 		wg.Wait()
 	}()
 
-	alerts, err := mem.NewAlerts(marker, *alertGCInterval)
+	// Peer state listeners have been registered, now we can join and get the initial state.
+	if peer != nil {
+		err = peer.Join(
+			*reconnectInterval,
+			*peerReconnectTimeout,
+		)
+		if err != nil {
+			level.Warn(logger).Log("msg", "unable to join gossip mesh", "err", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), *settleTimeout)
+		defer func() {
+			cancel()
+			if err := peer.Leave(10 * time.Second); err != nil {
+				level.Warn(logger).Log("msg", "unable to leave gossip mesh", "err", err)
+			}
+		}()
+		go peer.Settle(ctx, *gossipInterval*10)
+	}
+
+	alerts, err := mem.NewAlerts(context.Background(), marker, *alertGCInterval, logger)
 	if err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
@@ -266,16 +289,25 @@ func main() {
 	)
 	defer disp.Stop()
 
-	apiv := api.New(
+	apiV1 := apiv1.New(
 		alerts,
 		silences,
-		func(matchers []*labels.Matcher) dispatch.AlertOverview {
-			return disp.Groups(matchers)
-		},
 		marker.Status,
 		peer,
-		logger,
+		log.With(logger, "component", "api/v1"),
 	)
+
+	apiV2, err := apiv2.NewAPI(
+		alerts,
+		marker.Status,
+		silences,
+		peer,
+		log.With(logger, "component", "api/v2"),
+	)
+	if err != nil {
+		level.Error(logger).Log("err", fmt.Errorf("failed to create API v2: %v", err.Error()))
+		os.Exit(1)
+	}
 
 	amURL, err := extURL(*listenAddress, *externalURL)
 	if err != nil {
@@ -315,7 +347,12 @@ func main() {
 
 		hash = md5HashAsMetricValue(plainCfg)
 
-		err = apiv.Update(conf, time.Duration(conf.Global.ResolveTimeout))
+		err = apiV1.Update(conf, time.Duration(conf.Global.ResolveTimeout))
+		if err != nil {
+			return err
+		}
+
+		err = apiV2.Update(conf, time.Duration(conf.Global.ResolveTimeout))
 		if err != nil {
 			return err
 		}
@@ -370,10 +407,11 @@ func main() {
 
 	ui.Register(router, webReload, logger)
 
-	apiv.Register(router.WithPrefix("/api/v1"))
+	apiV1.Register(router.WithPrefix("/api/v1"))
 
-	level.Info(logger).Log("msg", "Listening", "address", *listenAddress)
-	go listen(*listenAddress, router, logger)
+	// TODO: How about having a http.handler for each (web, apiv1, apiv2) and
+	// combine them all together in `listen()`
+	go listen(*listenAddress, router, apiV2.Handler, logger)
 
 	var (
 		hup      = make(chan os.Signal)
@@ -388,7 +426,8 @@ func main() {
 		for {
 			select {
 			case <-hup:
-				reload()
+				// ignore error, already logged in `reload()`
+				_ = reload()
 			case errc := <-webReload:
 				errc <- reload()
 			}
@@ -439,8 +478,12 @@ func extURL(listen, external string) (*url.URL, error) {
 	return u, nil
 }
 
-func listen(listen string, router *route.Router, logger log.Logger) {
-	if err := http.ListenAndServe(listen, router); err != nil {
+func listen(listen string, apiV1Handler *route.Router, apiV2Handler http.Handler, logger log.Logger) {
+	level.Info(logger).Log("msg", "Listening", "address", listen)
+	mux := http.NewServeMux()
+	mux.Handle("/", apiV1Handler)
+	mux.Handle("/api/v2/", http.StripPrefix("/api/v2", apiV2Handler))
+	if err := http.ListenAndServe(listen, mux); err != nil {
 		level.Error(logger).Log("msg", "Listen error", "err", err)
 		os.Exit(1)
 	}

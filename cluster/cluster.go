@@ -1,8 +1,21 @@
+// Copyright 2018 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package cluster
 
 import (
 	"context"
-	"io/ioutil"
+	"fmt"
 	"math/rand"
 	"net"
 	"sort"
@@ -13,12 +26,10 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/gogo/protobuf/proto"
 	"github.com/hashicorp/memberlist"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 
-	"github.com/prometheus/alertmanager/cluster/clusterpb"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -27,20 +38,69 @@ type Peer struct {
 	mlist    *memberlist.Memberlist
 	delegate *delegate
 
+	resolvedPeers []string
+
 	mtx    sync.RWMutex
 	states map[string]State
 	stopc  chan struct{}
 	readyc chan struct{}
 
+	peerLock    sync.RWMutex
+	peers       map[string]peer
+	failedPeers []peer
+
+	failedReconnectionsCounter prometheus.Counter
+	reconnectionsCounter       prometheus.Counter
+	peerLeaveCounter           prometheus.Counter
+	peerUpdateCounter          prometheus.Counter
+	peerJoinCounter            prometheus.Counter
+
 	logger log.Logger
 }
 
+// peer is an internal type used for bookkeeping. It holds the state of peers
+// in the cluster.
+type peer struct {
+	status    PeerStatus
+	leaveTime time.Time
+
+	*memberlist.Node
+}
+
+// PeerStatus is the state that a peer is in.
+type PeerStatus int
+
 const (
-	DefaultPushPullInterval = 60 * time.Second
-	DefaultGossipInterval   = 200 * time.Millisecond
+	StatusNone PeerStatus = iota
+	StatusAlive
+	StatusFailed
 )
 
-func Join(
+func (s PeerStatus) String() string {
+	switch s {
+	case StatusNone:
+		return "none"
+	case StatusAlive:
+		return "alive"
+	case StatusFailed:
+		return "failed"
+	default:
+		panic(fmt.Sprintf("unknown PeerStatus: %d", s))
+	}
+}
+
+const (
+	DefaultPushPullInterval  = 60 * time.Second
+	DefaultGossipInterval    = 200 * time.Millisecond
+	DefaultTcpTimeout        = 10 * time.Second
+	DefaultProbeTimeout      = 500 * time.Millisecond
+	DefaultProbeInterval     = 1 * time.Second
+	DefaultReconnectInterval = 10 * time.Second
+	DefaultReconnectTimeout  = 6 * time.Hour
+	maxGossipPacketSize      = 1400
+)
+
+func Create(
 	l log.Logger,
 	reg prometheus.Registerer,
 	bindAddr string,
@@ -49,6 +109,9 @@ func Join(
 	waitIfEmpty bool,
 	pushPullInterval time.Duration,
 	gossipInterval time.Duration,
+	tcpTimeout time.Duration,
+	probeTimeout time.Duration,
+	probeInterval time.Duration,
 ) (*Peer, error) {
 	bindHost, bindPortStr, err := net.SplitHostPort(bindAddr)
 	if err != nil {
@@ -58,9 +121,9 @@ func Join(
 	if err != nil {
 		return nil, errors.Wrap(err, "invalid listen address")
 	}
+
 	var advertiseHost string
 	var advertisePort int
-
 	if advertiseAddr != "" {
 		var advertisePortStr string
 		advertiseHost, advertisePortStr, err = net.SplitHostPort(advertiseAddr)
@@ -87,6 +150,11 @@ func Join(
 		level.Warn(l).Log("err", "this node advertises itself on an unroutable address", "addr", addr.String())
 		level.Warn(l).Log("err", "this node will be unreachable in the cluster")
 		level.Warn(l).Log("err", "provide --cluster.advertise-address as a routable IP address or hostname")
+	} else if isAny(bindAddr) && advertiseHost == "" {
+		// memberlist doesn't advertise properly when the bind address is empty or unspecified.
+		level.Info(l).Log("msg", "setting advertise address explicitly", "addr", addr.String(), "port", bindPort)
+		advertiseHost = addr.String()
+		advertisePort = bindPort
 	}
 
 	// TODO(fabxc): generate human-readable but random names?
@@ -96,12 +164,21 @@ func Join(
 	}
 
 	p := &Peer{
-		states: map[string]State{},
-		stopc:  make(chan struct{}),
-		readyc: make(chan struct{}),
-		logger: l,
+		states:        map[string]State{},
+		stopc:         make(chan struct{}),
+		readyc:        make(chan struct{}),
+		logger:        l,
+		peers:         map[string]peer{},
+		resolvedPeers: resolvedPeers,
 	}
-	p.delegate = newDelegate(l, reg, p)
+
+	p.register(reg)
+
+	retransmit := len(knownPeers) / 2
+	if retransmit < 3 {
+		retransmit = 3
+	}
+	p.delegate = newDelegate(l, reg, p, retransmit)
 
 	cfg := memberlist.DefaultLANConfig()
 	cfg.Name = name.String()
@@ -111,11 +188,19 @@ func Join(
 	cfg.Events = p.delegate
 	cfg.GossipInterval = gossipInterval
 	cfg.PushPullInterval = pushPullInterval
-	cfg.LogOutput = ioutil.Discard
+	cfg.TCPTimeout = tcpTimeout
+	cfg.ProbeTimeout = probeTimeout
+	cfg.ProbeInterval = probeInterval
+	cfg.LogOutput = &logWriter{l: l}
+	cfg.GossipNodes = retransmit
+	cfg.UDPBufferSize = maxGossipPacketSize
 
-	if advertiseAddr != "" {
+	if advertiseHost != "" {
 		cfg.AdvertiseAddr = advertiseHost
 		cfg.AdvertisePort = advertisePort
+		p.setInitialFailed(resolvedPeers, fmt.Sprintf("%s:%d", advertiseHost, advertisePort))
+	} else {
+		p.setInitialFailed(resolvedPeers, bindAddr)
 	}
 
 	ml, err := memberlist.Create(cfg)
@@ -123,21 +208,123 @@ func Join(
 		return nil, errors.Wrap(err, "create memberlist")
 	}
 	p.mlist = ml
-
-	n, err := ml.Join(resolvedPeers)
-	if err != nil {
-		level.Warn(l).Log("msg", "failed to join cluster", "err", err)
-	} else {
-		level.Debug(l).Log("msg", "joined cluster", "peers", n)
-	}
-
-	if n > 0 {
-		go p.warnIfAlone(l, 10*time.Second)
-	}
 	return p, nil
 }
 
-func (p *Peer) warnIfAlone(logger log.Logger, d time.Duration) {
+func (p *Peer) Join(
+	reconnectInterval time.Duration,
+	reconnectTimeout time.Duration) error {
+	n, err := p.mlist.Join(p.resolvedPeers)
+	if err != nil {
+		level.Warn(p.logger).Log("msg", "failed to join cluster", "err", err)
+		if reconnectInterval != 0 {
+			level.Info(p.logger).Log("msg", fmt.Sprintf("will retry joining cluster every %v", reconnectInterval.String()))
+		}
+	} else {
+		level.Debug(p.logger).Log("msg", "joined cluster", "peers", n)
+	}
+
+	if reconnectInterval != 0 {
+		go p.handleReconnect(reconnectInterval)
+	}
+	if reconnectTimeout != 0 {
+		go p.handleReconnectTimeout(5*time.Minute, reconnectTimeout)
+	}
+
+	return err
+}
+
+// All peers are initially added to the failed list. They will be removed from
+// this list in peerJoin when making their initial connection.
+func (p *Peer) setInitialFailed(peers []string, myAddr string) {
+	if len(peers) == 0 {
+		return
+	}
+
+	p.peerLock.RLock()
+	defer p.peerLock.RUnlock()
+
+	now := time.Now()
+	for _, peerAddr := range peers {
+		if peerAddr == myAddr {
+			// Don't add ourselves to the initially failing list,
+			// we don't connect to ourselves.
+			continue
+		}
+		host, port, err := net.SplitHostPort(peerAddr)
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			// Don't add textual addresses since memberlist only advertises
+			// dotted decimal or IPv6 addresses.
+			continue
+		}
+		portUint, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			continue
+		}
+
+		pr := peer{
+			status:    StatusFailed,
+			leaveTime: now,
+			Node: &memberlist.Node{
+				Addr: ip,
+				Port: uint16(portUint),
+			},
+		}
+		p.failedPeers = append(p.failedPeers, pr)
+		p.peers[peerAddr] = pr
+	}
+}
+
+type logWriter struct {
+	l log.Logger
+}
+
+func (l *logWriter) Write(b []byte) (int, error) {
+	return len(b), level.Debug(l.l).Log("memberlist", string(b))
+}
+
+func (p *Peer) register(reg prometheus.Registerer) {
+	clusterFailedPeers := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "alertmanager_cluster_failed_peers",
+		Help: "Number indicating the current number of failed peers in the cluster.",
+	}, func() float64 {
+		p.peerLock.RLock()
+		defer p.peerLock.RUnlock()
+
+		return float64(len(p.failedPeers))
+	})
+	p.failedReconnectionsCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_reconnections_failed_total",
+		Help: "A counter of the number of failed cluster peer reconnection attempts.",
+	})
+
+	p.reconnectionsCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_reconnections_total",
+		Help: "A counter of the number of cluster peer reconnections.",
+	})
+
+	p.peerLeaveCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_peers_left_total",
+		Help: "A counter of the number of peers that have left.",
+	})
+	p.peerUpdateCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_peers_update_total",
+		Help: "A counter of the number of peers that have updated metadata.",
+	})
+	p.peerJoinCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_cluster_peers_joined_total",
+		Help: "A counter of the number of peers that have joined.",
+	})
+
+	reg.MustRegister(clusterFailedPeers, p.failedReconnectionsCounter, p.reconnectionsCounter,
+		p.peerLeaveCounter, p.peerUpdateCounter, p.peerJoinCounter)
+}
+
+func (p *Peer) handleReconnectTimeout(d time.Duration, timeout time.Duration) {
 	tick := time.NewTicker(d)
 	defer tick.Stop()
 
@@ -146,23 +333,157 @@ func (p *Peer) warnIfAlone(logger log.Logger, d time.Duration) {
 		case <-p.stopc:
 			return
 		case <-tick.C:
-			if n := p.mlist.NumMembers(); n <= 1 {
-				level.Warn(logger).Log("NumMembers", n, "msg", "I appear to be alone in the cluster")
-			}
+			p.removeFailedPeers(timeout)
 		}
 	}
 }
 
+func (p *Peer) removeFailedPeers(timeout time.Duration) {
+	p.peerLock.Lock()
+	defer p.peerLock.Unlock()
+
+	now := time.Now()
+
+	keep := make([]peer, 0, len(p.failedPeers))
+	for _, pr := range p.failedPeers {
+		if pr.leaveTime.Add(timeout).After(now) {
+			keep = append(keep, pr)
+		} else {
+			level.Debug(p.logger).Log("msg", "failed peer has timed out", "peer", pr.Node, "addr", pr.Address())
+			delete(p.peers, pr.Name)
+		}
+	}
+
+	p.failedPeers = keep
+}
+
+func (p *Peer) handleReconnect(d time.Duration) {
+	tick := time.NewTicker(d)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-p.stopc:
+			return
+		case <-tick.C:
+			p.reconnect()
+		}
+	}
+}
+
+func (p *Peer) reconnect() {
+	p.peerLock.RLock()
+	failedPeers := p.failedPeers
+	p.peerLock.RUnlock()
+
+	logger := log.With(p.logger, "msg", "reconnect")
+	for _, pr := range failedPeers {
+		// No need to do book keeping on failedPeers here. If a
+		// reconnect is successful, they will be announced in
+		// peerJoin().
+		if _, err := p.mlist.Join([]string{pr.Address()}); err != nil {
+			p.failedReconnectionsCounter.Inc()
+			level.Debug(logger).Log("result", "failure", "peer", pr.Node, "addr", pr.Address())
+		} else {
+			p.reconnectionsCounter.Inc()
+			level.Debug(logger).Log("result", "success", "peer", pr.Node, "addr", pr.Address())
+		}
+	}
+}
+
+func (p *Peer) peerJoin(n *memberlist.Node) {
+	p.peerLock.Lock()
+	defer p.peerLock.Unlock()
+
+	var oldStatus PeerStatus
+	pr, ok := p.peers[n.Address()]
+	if !ok {
+		oldStatus = StatusNone
+		pr = peer{
+			status: StatusAlive,
+			Node:   n,
+		}
+	} else {
+		oldStatus = pr.status
+		pr.Node = n
+		pr.status = StatusAlive
+		pr.leaveTime = time.Time{}
+	}
+
+	p.peers[n.Address()] = pr
+	p.peerJoinCounter.Inc()
+
+	if oldStatus == StatusFailed {
+		level.Debug(p.logger).Log("msg", "peer rejoined", "peer", pr.Node)
+		p.failedPeers = removeOldPeer(p.failedPeers, pr.Address())
+	}
+}
+
+func (p *Peer) peerLeave(n *memberlist.Node) {
+	p.peerLock.Lock()
+	defer p.peerLock.Unlock()
+
+	pr, ok := p.peers[n.Address()]
+	if !ok {
+		// Why are we receiving a leave notification from a node that
+		// never joined?
+		return
+	}
+
+	pr.status = StatusFailed
+	pr.leaveTime = time.Now()
+	p.failedPeers = append(p.failedPeers, pr)
+	p.peers[n.Address()] = pr
+
+	p.peerLeaveCounter.Inc()
+	level.Debug(p.logger).Log("msg", "peer left", "peer", pr.Node)
+}
+
+func (p *Peer) peerUpdate(n *memberlist.Node) {
+	p.peerLock.Lock()
+	defer p.peerLock.Unlock()
+
+	pr, ok := p.peers[n.Address()]
+	if !ok {
+		// Why are we receiving an update from a node that never
+		// joined?
+		return
+	}
+
+	pr.Node = n
+	p.peers[n.Address()] = pr
+
+	p.peerUpdateCounter.Inc()
+	level.Debug(p.logger).Log("msg", "peer updated", "peer", pr.Node)
+}
+
 // AddState adds a new state that will be gossiped. It returns a channel to which
 // broadcast messages for the state can be sent.
-func (p *Peer) AddState(key string, s State) *Channel {
+func (p *Peer) AddState(key string, s State, reg prometheus.Registerer) *Channel {
 	p.states[key] = s
-	return &Channel{key: key, bcast: p.delegate.bcast}
+	send := func(b []byte) {
+		p.delegate.bcast.QueueBroadcast(simpleBroadcast(b))
+	}
+	peers := func() []*memberlist.Node {
+		nodes := p.Peers()
+		for i, n := range nodes {
+			if n.Name == p.Self().Name {
+				nodes = append(nodes[:i], nodes[i+1:]...)
+				break
+			}
+		}
+		return nodes
+	}
+	sendOversize := func(n *memberlist.Node, b []byte) error {
+		return p.mlist.SendReliable(n, b)
+	}
+	return NewChannel(key, send, peers, sendOversize, p.logger, p.stopc, reg)
 }
 
 // Leave the cluster, waiting up to timeout.
 func (p *Peer) Leave(timeout time.Duration) error {
 	close(p.stopc)
+	level.Debug(p.logger).Log("msg", "leaving cluster")
 	return p.mlist.Leave(timeout)
 }
 
@@ -289,208 +610,12 @@ type State interface {
 	Merge(b []byte) error
 }
 
-// Channel allows clients to send messages for a specific state type that will be
-// broadcasted in a best-effort manner.
-type Channel struct {
-	key   string
-	bcast *memberlist.TransmitLimitedQueue
-}
-
 // We use a simple broadcast implementation in which items are never invalidated by others.
 type simpleBroadcast []byte
 
 func (b simpleBroadcast) Message() []byte                       { return []byte(b) }
 func (b simpleBroadcast) Invalidates(memberlist.Broadcast) bool { return false }
 func (b simpleBroadcast) Finished()                             {}
-
-// Broadcast enqueues a message for broadcasting.
-func (c *Channel) Broadcast(b []byte) {
-	b, err := proto.Marshal(&clusterpb.Part{Key: c.key, Data: b})
-	if err != nil {
-		return
-	}
-	c.bcast.QueueBroadcast(simpleBroadcast(b))
-}
-
-// delegate implements memberlist.Delegate and memberlist.EventDelegate
-// and broadcasts its peer's state in the cluster.
-type delegate struct {
-	*Peer
-
-	logger log.Logger
-	bcast  *memberlist.TransmitLimitedQueue
-
-	messagesReceived     *prometheus.CounterVec
-	messagesReceivedSize *prometheus.CounterVec
-	messagesSent         *prometheus.CounterVec
-	messagesSentSize     *prometheus.CounterVec
-}
-
-func newDelegate(l log.Logger, reg prometheus.Registerer, p *Peer) *delegate {
-	bcast := &memberlist.TransmitLimitedQueue{
-		NumNodes:       p.ClusterSize,
-		RetransmitMult: 3,
-	}
-	messagesReceived := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "alertmanager_cluster_messages_received_total",
-		Help: "Total number of cluster messsages received.",
-	}, []string{"msg_type"})
-	messagesReceivedSize := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "alertmanager_cluster_messages_received_size_total",
-		Help: "Total size of cluster messages received.",
-	}, []string{"msg_type"})
-	messagesSent := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "alertmanager_cluster_messages_sent_total",
-		Help: "Total number of cluster messsages sent.",
-	}, []string{"msg_type"})
-	messagesSentSize := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "alertmanager_cluster_messages_sent_size_total",
-		Help: "Total size of cluster messages sent.",
-	}, []string{"msg_type"})
-	gossipClusterMembers := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "alertmanager_cluster_members",
-		Help: "Number indicating current number of members in cluster.",
-	}, func() float64 {
-		return float64(p.ClusterSize())
-	})
-	peerPosition := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "alertmanager_peer_position",
-		Help: "Position the Alertmanager instance believes it's in. The position determines a peer's behavior in the cluster.",
-	}, func() float64 {
-		return float64(p.Position())
-	})
-	healthScore := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "alertmanager_cluster_health_score",
-		Help: "Health score of the cluster. Lower values are better and zero means 'totally healthy'.",
-	}, func() float64 {
-		return float64(p.mlist.GetHealthScore())
-	})
-	messagesQueued := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "alertmanager_cluster_messages_queued",
-		Help: "Number of cluster messsages which are queued.",
-	}, func() float64 {
-		return float64(bcast.NumQueued())
-	})
-
-	messagesReceived.WithLabelValues("full_state")
-	messagesReceivedSize.WithLabelValues("full_state")
-	messagesReceived.WithLabelValues("update")
-	messagesReceivedSize.WithLabelValues("update")
-	messagesSent.WithLabelValues("full_state")
-	messagesSentSize.WithLabelValues("full_state")
-	messagesSent.WithLabelValues("update")
-	messagesSentSize.WithLabelValues("update")
-
-	reg.MustRegister(messagesReceived, messagesReceivedSize, messagesSent, messagesSentSize,
-		gossipClusterMembers, peerPosition, healthScore, messagesQueued)
-
-	return &delegate{
-		logger:               l,
-		Peer:                 p,
-		bcast:                bcast,
-		messagesReceived:     messagesReceived,
-		messagesReceivedSize: messagesReceivedSize,
-		messagesSent:         messagesSent,
-		messagesSentSize:     messagesSentSize,
-	}
-}
-
-// NodeMeta retrieves meta-data about the current node when broadcasting an alive message.
-func (d *delegate) NodeMeta(limit int) []byte {
-	return []byte{}
-}
-
-// NotifyMsg is the callback invoked when a user-level gossip message is received.
-func (d *delegate) NotifyMsg(b []byte) {
-	d.messagesReceived.WithLabelValues("update").Inc()
-	d.messagesReceivedSize.WithLabelValues("update").Add(float64(len(b)))
-
-	var p clusterpb.Part
-	if err := proto.Unmarshal(b, &p); err != nil {
-		level.Warn(d.logger).Log("msg", "decode broadcast", "err", err)
-		return
-	}
-	s, ok := d.states[p.Key]
-	if !ok {
-		return
-	}
-	if err := s.Merge(p.Data); err != nil {
-		level.Warn(d.logger).Log("msg", "merge broadcast", "err", err, "key", p.Key)
-		return
-	}
-}
-
-// GetBroadcasts is called when user data messages can be broadcasted.
-func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
-	msgs := d.bcast.GetBroadcasts(overhead, limit)
-	d.messagesSent.WithLabelValues("update").Add(float64(len(msgs)))
-	for _, m := range msgs {
-		d.messagesSentSize.WithLabelValues("update").Add(float64(len(m)))
-	}
-	return msgs
-}
-
-// LocalState is called when gossip fetches local state.
-func (d *delegate) LocalState(_ bool) []byte {
-	all := &clusterpb.FullState{
-		Parts: make([]clusterpb.Part, 0, len(d.states)),
-	}
-	for key, s := range d.states {
-		b, err := s.MarshalBinary()
-		if err != nil {
-			level.Warn(d.logger).Log("msg", "encode local state", "err", err, "key", key)
-			return nil
-		}
-		all.Parts = append(all.Parts, clusterpb.Part{Key: key, Data: b})
-	}
-	b, err := proto.Marshal(all)
-	if err != nil {
-		level.Warn(d.logger).Log("msg", "encode local state", "err", err)
-		return nil
-	}
-	d.messagesSent.WithLabelValues("full_state").Inc()
-	d.messagesSentSize.WithLabelValues("full_state").Add(float64(len(b)))
-	return b
-}
-
-func (d *delegate) MergeRemoteState(buf []byte, _ bool) {
-	d.messagesReceived.WithLabelValues("full_state").Inc()
-	d.messagesReceivedSize.WithLabelValues("full_state").Add(float64(len(buf)))
-
-	var fs clusterpb.FullState
-	if err := proto.Unmarshal(buf, &fs); err != nil {
-		level.Warn(d.logger).Log("msg", "merge remote state", "err", err)
-		return
-	}
-	d.mtx.RLock()
-	defer d.mtx.RUnlock()
-
-	for _, p := range fs.Parts {
-		s, ok := d.states[p.Key]
-		if !ok {
-			continue
-		}
-		if err := s.Merge(p.Data); err != nil {
-			level.Warn(d.logger).Log("msg", "merge remote state", "err", err, "key", p.Key)
-			return
-		}
-	}
-}
-
-// NotifyJoin is called if a peer joins the cluster.
-func (d *delegate) NotifyJoin(n *memberlist.Node) {
-	level.Debug(d.logger).Log("received", "NotifyJoin", "node", n.Name, "addr", n.Address())
-}
-
-// NotifyLeave is called if a peer leaves the cluster.
-func (d *delegate) NotifyLeave(n *memberlist.Node) {
-	level.Debug(d.logger).Log("received", "NotifyLeave", "node", n.Name, "addr", n.Address())
-}
-
-// NotifyUpdate is called if a cluster peer gets updated.
-func (d *delegate) NotifyUpdate(n *memberlist.Node) {
-	level.Debug(d.logger).Log("received", "NotifyUpdate", "node", n.Name, "addr", n.Address())
-}
 
 func resolvePeers(ctx context.Context, peers []string, myAddress string, res net.Resolver, waitIfEmpty bool) ([]string, error) {
 	var resolvedPeers []string
@@ -587,6 +712,13 @@ func isUnroutable(addr string) bool {
 	return false
 }
 
+func isAny(addr string) bool {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	return addr == "" || net.ParseIP(addr).IsUnspecified()
+}
+
 // retry executes f every interval seconds until timeout or no error is returned from f.
 func retry(interval time.Duration, stopc <-chan struct{}, f func() error) error {
 	tick := time.NewTicker(interval)
@@ -603,4 +735,15 @@ func retry(interval time.Duration, stopc <-chan struct{}, f func() error) error 
 		case <-tick.C:
 		}
 	}
+}
+
+func removeOldPeer(old []peer, addr string) []peer {
+	new := make([]peer, 0, len(old))
+	for _, p := range old {
+		if p.Address() != addr {
+			new = append(new, p)
+		}
+	}
+
+	return new
 }

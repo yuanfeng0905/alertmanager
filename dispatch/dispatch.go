@@ -1,3 +1,16 @@
+// Copyright 2018 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package dispatch
 
 import (
@@ -9,11 +22,11 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
 	"golang.org/x/net/context"
 
 	"github.com/prometheus/alertmanager/notify"
 	"github.com/prometheus/alertmanager/provider"
+	"github.com/prometheus/alertmanager/store"
 	"github.com/prometheus/alertmanager/types"
 )
 
@@ -69,103 +82,6 @@ func (d *Dispatcher) Run() {
 
 	d.run(d.alerts.Subscribe())
 	close(d.done)
-}
-
-// AlertBlock contains a list of alerts associated with a set of
-// routing options.
-type AlertBlock struct {
-	RouteOpts *RouteOpts  `json:"routeOpts"`
-	Alerts    []*APIAlert `json:"alerts"`
-}
-
-// APIAlert is the API representation of an alert, which is a regular alert
-// annotated with silencing and inhibition info.
-type APIAlert struct {
-	*model.Alert
-	Status      types.AlertStatus `json:"status"`
-	Receivers   []string          `json:"receivers"`
-	Fingerprint string            `json:"fingerprint"`
-}
-
-// AlertGroup is a list of alert blocks grouped by the same label set.
-type AlertGroup struct {
-	Labels   model.LabelSet `json:"labels"`
-	GroupKey string         `json:"groupKey"`
-	Blocks   []*AlertBlock  `json:"blocks"`
-}
-
-// AlertOverview is a representation of all active alerts in the system.
-type AlertOverview []*AlertGroup
-
-func (ao AlertOverview) Swap(i, j int)      { ao[i], ao[j] = ao[j], ao[i] }
-func (ao AlertOverview) Less(i, j int) bool { return ao[i].Labels.Before(ao[j].Labels) }
-func (ao AlertOverview) Len() int           { return len(ao) }
-
-func matchesFilterLabels(a *APIAlert, matchers []*labels.Matcher) bool {
-	for _, m := range matchers {
-		if v, prs := a.Labels[model.LabelName(m.Name)]; !prs || !m.Matches(string(v)) {
-			return false
-		}
-	}
-
-	return true
-}
-
-// Groups populates an AlertOverview from the dispatcher's internal state.
-func (d *Dispatcher) Groups(matchers []*labels.Matcher) AlertOverview {
-	overview := AlertOverview{}
-
-	d.mtx.RLock()
-	defer d.mtx.RUnlock()
-
-	seen := map[model.Fingerprint]*AlertGroup{}
-
-	for route, ags := range d.aggrGroups {
-		for _, ag := range ags {
-			alertGroup, ok := seen[ag.fingerprint()]
-			if !ok {
-				alertGroup = &AlertGroup{Labels: ag.labels}
-				alertGroup.GroupKey = ag.GroupKey()
-
-				seen[ag.fingerprint()] = alertGroup
-			}
-
-			now := time.Now()
-
-			var apiAlerts []*APIAlert
-			for _, a := range types.Alerts(ag.alertSlice()...) {
-				if !a.EndsAt.IsZero() && a.EndsAt.Before(now) {
-					continue
-				}
-				status := d.marker.Status(a.Fingerprint())
-				aa := &APIAlert{
-					Alert:       a,
-					Status:      status,
-					Fingerprint: a.Fingerprint().String(),
-				}
-
-				if !matchesFilterLabels(aa, matchers) {
-					continue
-				}
-
-				apiAlerts = append(apiAlerts, aa)
-			}
-			if len(apiAlerts) == 0 {
-				continue
-			}
-
-			alertGroup.Blocks = append(alertGroup.Blocks, &AlertBlock{
-				RouteOpts: &route.RouteOpts,
-				Alerts:    apiAlerts,
-			})
-
-			overview = append(overview, alertGroup)
-		}
-	}
-
-	sort.Sort(overview)
-
-	return overview
 }
 
 func (d *Dispatcher) run(it provider.AlertIterator) {
@@ -247,12 +163,13 @@ func (d *Dispatcher) processAlert(alert *types.Alert, route *Route) {
 	fp := groupLabels.Fingerprint()
 
 	d.mtx.Lock()
+	defer d.mtx.Unlock()
+
 	group, ok := d.aggrGroups[route]
 	if !ok {
 		group = map[model.Fingerprint]*aggrGroup{}
 		d.aggrGroups[route] = group
 	}
-	d.mtx.Unlock()
 
 	// If the group does not exist, create it.
 	ag, ok := group[fp]
@@ -281,6 +198,7 @@ type aggrGroup struct {
 	logger   log.Logger
 	routeKey string
 
+	alerts  *store.Alerts
 	ctx     context.Context
 	cancel  func()
 	done    chan struct{}
@@ -288,7 +206,6 @@ type aggrGroup struct {
 	timeout func(time.Duration) time.Duration
 
 	mtx        sync.RWMutex
-	alerts     map[model.Fingerprint]*types.Alert
 	hasFlushed bool
 }
 
@@ -302,9 +219,10 @@ func newAggrGroup(ctx context.Context, labels model.LabelSet, r *Route, to func(
 		routeKey: r.Key(),
 		opts:     &r.RouteOpts,
 		timeout:  to,
-		alerts:   map[model.Fingerprint]*types.Alert{},
+		alerts:   store.NewAlerts(15 * time.Minute),
 	}
 	ag.ctx, ag.cancel = context.WithCancel(ctx)
+	ag.alerts.Run(ag.ctx)
 
 	ag.logger = log.With(logger, "aggrGroup", ag)
 
@@ -325,17 +243,6 @@ func (ag *aggrGroup) GroupKey() string {
 
 func (ag *aggrGroup) String() string {
 	return ag.GroupKey()
-}
-
-func (ag *aggrGroup) alertSlice() []*types.Alert {
-	ag.mtx.RLock()
-	defer ag.mtx.RUnlock()
-
-	var alerts []*types.Alert
-	for _, a := range ag.alerts {
-		alerts = append(alerts, a)
-	}
-	return alerts
 }
 
 func (ag *aggrGroup) run(nf notifyFunc) {
@@ -390,23 +297,21 @@ func (ag *aggrGroup) stop() {
 
 // insert inserts the alert into the aggregation group.
 func (ag *aggrGroup) insert(alert *types.Alert) {
-	ag.mtx.Lock()
-	defer ag.mtx.Unlock()
-
-	ag.alerts[alert.Fingerprint()] = alert
+	if err := ag.alerts.Set(alert); err != nil {
+		level.Error(ag.logger).Log("msg", "error on set alert", "err", err)
+	}
 
 	// Immediately trigger a flush if the wait duration for this
 	// alert is already over.
+	ag.mtx.Lock()
+	defer ag.mtx.Unlock()
 	if !ag.hasFlushed && alert.StartsAt.Add(ag.opts.GroupWait).Before(time.Now()) {
 		ag.next.Reset(0)
 	}
 }
 
 func (ag *aggrGroup) empty() bool {
-	ag.mtx.RLock()
-	defer ag.mtx.RUnlock()
-
-	return len(ag.alerts) == 0
+	return ag.alerts.Count() == 0
 }
 
 // flush sends notifications for all new alerts.
@@ -414,50 +319,35 @@ func (ag *aggrGroup) flush(notify func(...*types.Alert) bool) {
 	if ag.empty() {
 		return
 	}
-	ag.mtx.Lock()
 
 	var (
-		alerts      = make(map[model.Fingerprint]*types.Alert, len(ag.alerts))
-		alertsSlice = make([]*types.Alert, 0, len(ag.alerts))
+		alerts      = ag.alerts.List()
+		alertsSlice = make(types.AlertSlice, 0, ag.alerts.Count())
 	)
-	for fp, alert := range ag.alerts {
-		alerts[fp] = alert
+	for alert := range alerts {
 		alertsSlice = append(alertsSlice, alert)
 	}
+	sort.Stable(alertsSlice)
 
-	sort.SliceStable(alertsSlice, func(i, j int) bool {
-		// Look at labels.job, then labels.instance.
-		for _, override_key := range [...]model.LabelName{"job", "instance"} {
-			key_i, ok_i := alertsSlice[i].Labels[override_key]
-			if !ok_i {
-				return true
-			}
-			key_j, ok_j := alertsSlice[j].Labels[override_key]
-			if !ok_j {
-				return false
-			}
-
-			if key_i != key_j {
-				return key_i > key_j
-			}
-		}
-
-		return alertsSlice[i].Labels.Before(alertsSlice[j].Labels)
-	})
-
-	ag.mtx.Unlock()
-
-	level.Debug(ag.logger).Log("msg", "Flushing", "alerts", fmt.Sprintf("%v", alertsSlice))
+	level.Debug(ag.logger).Log("msg", "flushing", "alerts", fmt.Sprintf("%v", alertsSlice))
 
 	if notify(alertsSlice...) {
-		ag.mtx.Lock()
-		for fp, a := range alerts {
+		for _, a := range alertsSlice {
 			// Only delete if the fingerprint has not been inserted
 			// again since we notified about it.
-			if a.Resolved() && ag.alerts[fp] == a {
-				delete(ag.alerts, fp)
+			fp := a.Fingerprint()
+			got, err := ag.alerts.Get(fp)
+			if err != nil {
+				// This should only happen if the Alert was
+				// deleted from the store during the flush.
+				level.Error(ag.logger).Log("msg", "failed to get alert", "err", err)
+				continue
+			}
+			if a.Resolved() && got == a {
+				if err := ag.alerts.Delete(fp); err != nil {
+					level.Error(ag.logger).Log("msg", "error on delete alert", "err", err)
+				}
 			}
 		}
-		ag.mtx.Unlock()
 	}
 }

@@ -1,20 +1,63 @@
-## 0.15.0-rc.1 / 2018-03-22
+## Next release
 
-* [BUGFIX/CHANGE] The default group_by is no labels. (#1287)
+* [CHANGE] Revert Alertmanager working directory changes in Docker image back to `/alertmanager` (#1435)
+* [CHANGE] Remove `api/v1/alerts/groups` GET endpoint (#1508)
+* [FEATURE] [amtool] Added `config routes` tools for vizualization and testing routes (#1511)
+* [BUGFIX] [amtool] Fixed issue with loading path of a default configs (#1529)
+
+## 0.15.2 / 2018-08-14
+
+* [ENHANCEMENT] [amtool] Add support for stdin to check-config (#1431)
+* [ENHANCEMENT] Log PagerDuty v1 response on BadRequest (#1481)
+* [BUGFIX] Correctly encode query strings in notifiers (#1516)
+* [BUGFIX] Add cache control headers to the API responses to avoid IE caching (#1500)
+* [BUGFIX] Avoid listener blocking on unsubscribe (#1482)
+* [BUGFIX] Fix a bunch of unhandled errors (#1501)
+* [BUGFIX] Update PagerDuty API V2 to send full details on resolve (#1483)
+* [BUGFIX] Validate URLs at config load time (#1468)
+* [BUGFIX] Fix Settle() interval (#1478)
+* [BUGFIX] Fix email to be green if only none firing (#1475)
+* [BUGFIX] Handle errors in notify (#1474)
+* [BUGFIX] Fix templating of hipchat room id (#1463)
+
+## 0.15.1 / 2018-07-10
+
+* [BUGFIX] Fix email template typo in alert-warning style (#1421)
+* [BUGFIX] Fix regression in Pager Duty config (#1455)
+* [BUGFIX] Catch templating errors in Wechat Notify (#1436)
+* [BUGFIX] Fail when no private address can be found for cluster (#1437)
+* [BUGFIX] Make sure we don't miss the first pushPull when joining cluster (#1456)
+* [BUGFIX] Fix concurrent read and write group error in dispatch (#1447)
+
+## 0.15.0 / 2018-06-22
+
+* [CHANGE] [amtool] Update silence add and update flags (#1298)
+* [CHANGE] Replace deprecated InstrumentHandler() (#1302)
+* [CHANGE] Validate Slack field config and only allow the necessary input (#1334)
+* [CHANGE] Remove legacy alert ingest endpoint (#1362)
+* [CHANGE] Move to memberlist as underlying gossip protocol including cluster flag changes from --mesh.xxx to --cluster.xxx (#1232)
+* [CHANGE] Move Alertmanager working directory in Docker image to /etc/alertmanager (#1313)
+* [BUGFIX/CHANGE] The default group by is no labels. (#1287)
+* [FEATURE] [amtool] Filter alerts by receiver (#1402)
 * [FEATURE] Wait for mesh to settle before sending alerts (#1209)
 * [FEATURE] [amtool] Support basic auth in alertmanager url (#1279)
+* [FEATURE] Make HTTP clients used for integrations configurable
+* [ENHANCEMENT] Support receiving alerts with end time and zero start time
 * [ENHANCEMENT] Sort dispatched alerts by job+instance (#1234)
+* [ENHANCEMENT] Support alert query filters `active` and `unprocessed` (#1366)
+* [ENHANCEMENT] [amtool] Expose alert query flags --active and --unprocessed (#1370)
+* [ENHANCEMENT] Add Slack actions to notifications (#1355)
+* [BUGFIX] Register nflog snapShotSize metric
+* [BUGFIX] Sort alerts in correct order before flushing to notifiers (#1349)
+* [BUGFIX] Don't reset initial wait timer if flush is in-progress (#1301)
+* [BUGFIX] Fix resolved alerts still inhibiting (#1331)
+* [BUGFIX] Template wechat config fields (#1356)
+* [BUGFIX] Notify resolved alerts properly (#1408)
+* [BUGFIX] Fix parsing for label values with commas (#1395)
 * [BUGFIX] Hide sensitive Wechat configuration (#1253)
 * [BUGFIX] Prepopulate matchers when recreating a silence (#1270)
 * [BUGFIX] Fix wechat panic (#1293)
 * [BUGFIX] Allow empty matchers in silences/filtering (#1289)
-* [BUGFIX] Fix gossip broadcast EOF errors (#1286)
-
-## 0.15.0-rc.0 / 2018-02-28
-
-* [CHANGE] Moved to memberlist as underlying gossip protocol
-* [FEATURE] Make HTTP clients used for integrations configurable
-* [ENHANCEMENT] Support receiving alerts with end time and zero start time
 * [BUGFIX] Properly configure HTTP client for Wechat integration
 
 ## 0.14.0 / 2018-02-12

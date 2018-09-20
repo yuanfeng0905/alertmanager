@@ -138,7 +138,10 @@ type httpStatusAPI struct {
 func (h *httpStatusAPI) Get(ctx context.Context) (*ServerStatus, error) {
 	u := h.client.URL(epStatus, nil)
 
-	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
+	}
 
 	_, body, err := h.client.Do(ctx, req)
 	if err != nil {
@@ -154,7 +157,7 @@ func (h *httpStatusAPI) Get(ctx context.Context) (*ServerStatus, error) {
 // AlertAPI provides bindings for the Alertmanager's alert API.
 type AlertAPI interface {
 	// List returns all the active alerts.
-	List(ctx context.Context, filter string, silenced, inhibited bool) ([]*ExtendedAlert, error)
+	List(ctx context.Context, filter, receiver string, silenced, inhibited, active, unprocessed bool) ([]*ExtendedAlert, error)
 	// Push sends a list of alerts to the Alertmanager.
 	Push(ctx context.Context, alerts ...Alert) error
 }
@@ -194,7 +197,7 @@ type httpAlertAPI struct {
 	client api.Client
 }
 
-func (h *httpAlertAPI) List(ctx context.Context, filter string, silenced, inhibited bool) ([]*ExtendedAlert, error) {
+func (h *httpAlertAPI) List(ctx context.Context, filter, receiver string, silenced, inhibited, active, unprocessed bool) ([]*ExtendedAlert, error) {
 	u := h.client.URL(epAlerts, nil)
 	params := url.Values{}
 	if filter != "" {
@@ -202,9 +205,15 @@ func (h *httpAlertAPI) List(ctx context.Context, filter string, silenced, inhibi
 	}
 	params.Add("silenced", fmt.Sprintf("%t", silenced))
 	params.Add("inhibited", fmt.Sprintf("%t", inhibited))
+	params.Add("active", fmt.Sprintf("%t", active))
+	params.Add("unprocessed", fmt.Sprintf("%t", unprocessed))
+	params.Add("receiver", receiver)
 	u.RawQuery = params.Encode()
 
-	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
+	}
 
 	_, body, err := h.client.Do(ctx, req)
 	if err != nil {
@@ -225,9 +234,12 @@ func (h *httpAlertAPI) Push(ctx context.Context, alerts ...Alert) error {
 		return err
 	}
 
-	req, _ := http.NewRequest(http.MethodPost, u.String(), &buf)
+	req, err := http.NewRequest(http.MethodPost, u.String(), &buf)
+	if err != nil {
+		return fmt.Errorf("error creating request: %v", err)
+	}
 
-	_, _, err := h.client.Do(ctx, req)
+	_, _, err = h.client.Do(ctx, req)
 	return err
 }
 
@@ -257,7 +269,10 @@ func (h *httpSilenceAPI) Get(ctx context.Context, id string) (*types.Silence, er
 		"id": id,
 	})
 
-	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
+	}
 
 	_, body, err := h.client.Do(ctx, req)
 	if err != nil {
@@ -275,9 +290,12 @@ func (h *httpSilenceAPI) Expire(ctx context.Context, id string) error {
 		"id": id,
 	})
 
-	req, _ := http.NewRequest(http.MethodDelete, u.String(), nil)
+	req, err := http.NewRequest(http.MethodDelete, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("error creating request: %v", err)
+	}
 
-	_, _, err := h.client.Do(ctx, req)
+	_, _, err = h.client.Do(ctx, req)
 	return err
 }
 
@@ -289,7 +307,10 @@ func (h *httpSilenceAPI) Set(ctx context.Context, sil types.Silence) (string, er
 		return "", err
 	}
 
-	req, _ := http.NewRequest(http.MethodPost, u.String(), &buf)
+	req, err := http.NewRequest(http.MethodPost, u.String(), &buf)
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %v", err)
+	}
 
 	_, body, err := h.client.Do(ctx, req)
 	if err != nil {
@@ -312,7 +333,10 @@ func (h *httpSilenceAPI) List(ctx context.Context, filter string) ([]*types.Sile
 	}
 	u.RawQuery = params.Encode()
 
-	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
+	}
 
 	_, body, err := h.client.Do(ctx, req)
 	if err != nil {

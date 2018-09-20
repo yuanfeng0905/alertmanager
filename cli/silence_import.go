@@ -1,3 +1,16 @@
+// Copyright 2018 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package cli
 
 import (
@@ -43,17 +56,17 @@ func configureSilenceImportCmd(cc *kingpin.CmdClause) {
 	importCmd.Flag("force", "Force adding new silences even if it already exists").Short('f').BoolVar(&c.force)
 	importCmd.Flag("worker", "Number of concurrent workers to use for import").Short('w').Default("8").IntVar(&c.workers)
 	importCmd.Arg("input-file", "JSON file with silences").ExistingFileVar(&c.file)
-	importCmd.Action(c.bulkImport)
+	importCmd.Action(execWithTimeout(c.bulkImport))
 }
 
-func addSilenceWorker(sclient client.SilenceAPI, silencec <-chan *types.Silence, errc chan<- error) {
+func addSilenceWorker(ctx context.Context, sclient client.SilenceAPI, silencec <-chan *types.Silence, errc chan<- error) {
 	for s := range silencec {
-		silenceID, err := sclient.Set(context.Background(), *s)
+		silenceID, err := sclient.Set(ctx, *s)
 		sid := s.ID
 		if err != nil && strings.Contains(err.Error(), "not found") {
 			// silence doesn't exists yet, retry to create as a new one
 			s.ID = ""
-			silenceID, err = sclient.Set(context.Background(), *s)
+			silenceID, err = sclient.Set(ctx, *s)
 		}
 
 		if err != nil {
@@ -65,7 +78,7 @@ func addSilenceWorker(sclient client.SilenceAPI, silencec <-chan *types.Silence,
 	}
 }
 
-func (c *silenceImportCmd) bulkImport(ctx *kingpin.ParseContext) error {
+func (c *silenceImportCmd) bulkImport(ctx context.Context, _ *kingpin.ParseContext) error {
 	input := os.Stdin
 	var err error
 	if c.file != "" {
@@ -94,7 +107,7 @@ func (c *silenceImportCmd) bulkImport(ctx *kingpin.ParseContext) error {
 	for w := 0; w < c.workers; w++ {
 		wg.Add(1)
 		go func() {
-			addSilenceWorker(silenceAPI, silencec, errc)
+			addSilenceWorker(ctx, silenceAPI, silencec, errc)
 			wg.Done()
 		}()
 	}

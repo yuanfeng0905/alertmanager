@@ -1,3 +1,16 @@
+// Copyright 2018 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package config
 
 import (
@@ -78,6 +91,63 @@ service_key: ''
 	}
 }
 
+func TestPagerdutyDetails(t *testing.T) {
+
+	var tests = []struct {
+		in      string
+		checkFn func(map[string]string)
+	}{
+		{
+			in: `
+routing_key: 'xyz'
+`,
+			checkFn: func(d map[string]string) {
+				if len(d) != 4 {
+					t.Errorf("expected 4 items, got: %d", len(d))
+				}
+			},
+		},
+		{
+			in: `
+routing_key: 'xyz'
+details:
+  key1: val1
+`,
+			checkFn: func(d map[string]string) {
+				if len(d) != 5 {
+					t.Errorf("expected 5 items, got: %d", len(d))
+				}
+			},
+		},
+		{
+			in: `
+routing_key: 'xyz'
+details:
+  key1: val1
+  key2: val2
+  firing: firing
+`,
+			checkFn: func(d map[string]string) {
+				if len(d) != 6 {
+					t.Errorf("expected 6 items, got: %d", len(d))
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		var cfg PagerdutyConfig
+		err := yaml.UnmarshalStrict([]byte(tc.in), &cfg)
+
+		if err != nil {
+			t.Errorf("expected no error, got:%v", err)
+		}
+
+		if tc.checkFn != nil {
+			tc.checkFn(cfg.Details)
+		}
+	}
+}
+
 func TestHipchatRoomIDIsPresent(t *testing.T) {
 	in := `
 room_id: ''
@@ -96,9 +166,7 @@ room_id: ''
 }
 
 func TestWebhookURLIsPresent(t *testing.T) {
-	in := `
-url: ''
-`
+	in := `{}`
 	var cfg WebhookConfig
 	err := yaml.UnmarshalStrict([]byte(in), &cfg)
 

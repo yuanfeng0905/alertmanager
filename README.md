@@ -171,6 +171,21 @@ receivers:
   - routing_key: <team-DB-key>
 ```
 
+## API
+
+The current Alertmanager API is version 2. This API is fully generated via the
+[OpenAPI
+project](https://github.com/OAI/OpenAPI-Specification/blob/master/versions/2.0.md)
+and [Go Swagger](https://github.com/go-swagger/go-swagger/) with the exception
+of the HTTP handlers themselves. The API specification can be found in
+[api/v2/openapi.yaml](api/v2/openapi.yaml). A HTML rendered version can be
+accessed
+[here](http://petstore.swagger.io/?url=https://raw.githubusercontent.com/prometheus/alertmanager/master/api/v2/openapi.yaml).
+Clients can be easily generated via any OpenAPI generator for all major
+languages.
+
+_API v2 is still under heavy development and thereby subject to change._
+
 ## Amtool
 
 `amtool` is a cli tool for interacting with the alertmanager api. It is bundled with all releases of alertmanager.
@@ -281,11 +296,30 @@ comment_required: true
 
 # Set a default output format. (unset defaults to simple)
 output: extended
+
+# Set a default receiver
+receiver: team-X-pager
+```
+
+### Routes
+
+Amtool allows you to vizualize the routes of your configuration in form of text tree view.
+Also you can use it to test the routing by passing it label set of an alert
+and it prints out all receivers the alert would match ordered and separated by `,`.
+(If you use `--verify.receivers` amtool returns error code 1 on mismatch)
+
+Example of usage:
+```
+# View routing tree of remote Alertmanager
+amtool config routes --alertmanager.url=http://localhost:9090
+
+# Test if alert matches expected receiver
+./amtool config routes test --config.file=doc/examples/simple.yml --tree --verify.receivers=team-X-pager service=database owner=team-X
 ```
 
 ## High Availability
 
-> Warning: High Availability is under active development
+AlertManager's high availability is in production use at many companies.
 
 To create a highly available cluster of the Alertmanager the instances need to
 be configured to communicate with each other. This is configured using the
@@ -301,9 +335,17 @@ be configured to communicate with each other. This is configured using the
   convergence speeds at expense of bandwidth (default "1m0s")
 - `--cluster.settle-timeout` value: maximum time to wait for cluster
   connections to settle before evaluating notifications.
+- `--cluster.tcp-timeout` value: timeout value for tcp connections, reads and writes (default "10s")
+- `--cluster.probe-timeout` value: time to wait for ack before marking node unhealthy
+  (default "500ms")
+- `--cluster.probe-interval` value: interval between random node probes (default "1s")
 
 The chosen port in the `cluster.listen-address` flag is the port that needs to be
 specified in the `cluster.peer` flag of the other peers.
+
+The `cluster.advertise-address` flag is required if the instance doesn't have
+an IP address that is part of [RFC 6980](https://tools.ietf.org/html/rfc6890)
+with a default route.
 
 To start a cluster of three peers on your local machine use `goreman` and the
 Procfile within this repository.
@@ -331,7 +373,7 @@ Refer to [ui/app/CONTRIBUTING.md](ui/app/CONTRIBUTING.md).
 
 ## Architecture
 
-![](https://raw.githubusercontent.com/prometheus/alertmanager/4e6695682acd2580773a904e4aa2e3b927ee27b7/doc/arch.jpg)
+![](doc/arch.svg)
 
 
 [travis]: https://travis-ci.org/prometheus/alertmanager

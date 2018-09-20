@@ -14,69 +14,85 @@
 package mem
 
 import (
+	"context"
 	"sync"
 	"time"
 
-	"github.com/prometheus/alertmanager/provider"
-	"github.com/prometheus/alertmanager/types"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/common/model"
+
+	"github.com/prometheus/alertmanager/provider"
+	"github.com/prometheus/alertmanager/store"
+	"github.com/prometheus/alertmanager/types"
 )
+
+const alertChannelLength = 200
 
 // Alerts gives access to a set of alerts. All methods are goroutine-safe.
 type Alerts struct {
-	mtx        sync.RWMutex
-	alerts     map[model.Fingerprint]*types.Alert
-	marker     types.Marker
-	intervalGC time.Duration
-	stopGC     chan struct{}
+	alerts *store.Alerts
+	cancel context.CancelFunc
 
-	listeners map[int]chan *types.Alert
+	mtx       sync.Mutex
+	listeners map[int]listeningAlerts
 	next      int
+
+	logger log.Logger
+}
+
+type listeningAlerts struct {
+	alerts chan *types.Alert
+	done   chan struct{}
 }
 
 // NewAlerts returns a new alert provider.
-func NewAlerts(m types.Marker, intervalGC time.Duration) (*Alerts, error) {
+func NewAlerts(ctx context.Context, m types.Marker, intervalGC time.Duration, l log.Logger) (*Alerts, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	a := &Alerts{
-		alerts:     map[model.Fingerprint]*types.Alert{},
-		marker:     m,
-		intervalGC: intervalGC,
-		stopGC:     make(chan struct{}),
-		listeners:  map[int]chan *types.Alert{},
-		next:       0,
+		alerts:    store.NewAlerts(intervalGC),
+		cancel:    cancel,
+		listeners: map[int]listeningAlerts{},
+		next:      0,
+		logger:    log.With(l, "component", "provider"),
 	}
-	go a.runGC()
+	a.alerts.SetGCCallback(func(alerts []*types.Alert) {
+		for _, alert := range alerts {
+			// As we don't persist alerts, we no longer consider them after
+			// they are resolved. Alerts waiting for resolved notifications are
+			// held in memory in aggregation groups redundantly.
+			m.Delete(alert.Fingerprint())
+		}
+
+		a.mtx.Lock()
+		for i, l := range a.listeners {
+			select {
+			case <-l.done:
+				delete(a.listeners, i)
+				close(l.alerts)
+			default:
+				// listener is not closed yet, hence proceed.
+			}
+		}
+		a.mtx.Unlock()
+	})
+	a.alerts.Run(ctx)
 
 	return a, nil
 }
 
-func (a *Alerts) runGC() {
-	for {
-		select {
-		case <-a.stopGC:
-			return
-		case <-time.After(a.intervalGC):
-		}
-
-		a.mtx.Lock()
-
-		for fp, alert := range a.alerts {
-			// As we don't persist alerts, we no longer consider them after
-			// they are resolved. Alerts waiting for resolved notifications are
-			// held in memory in aggregation groups redundantly.
-			if alert.EndsAt.Before(time.Now()) {
-				delete(a.alerts, fp)
-				a.marker.Delete(fp)
-			}
-		}
-
-		a.mtx.Unlock()
+// Close the alert provider.
+func (a *Alerts) Close() {
+	if a.cancel != nil {
+		a.cancel()
 	}
 }
 
-// Close the alert provider.
-func (a *Alerts) Close() error {
-	close(a.stopGC)
-	return nil
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // Subscribe returns an iterator over active alerts that have not been
@@ -84,53 +100,35 @@ func (a *Alerts) Close() error {
 // They are not guaranteed to be in chronological order.
 func (a *Alerts) Subscribe() provider.AlertIterator {
 	var (
-		ch   = make(chan *types.Alert, 200)
+		ch   = make(chan *types.Alert, max(a.alerts.Count(), alertChannelLength))
 		done = make(chan struct{})
 	)
-	alerts, err := a.getPending()
+
+	for a := range a.alerts.List() {
+		ch <- a
+	}
 
 	a.mtx.Lock()
 	i := a.next
 	a.next++
-	a.listeners[i] = ch
+	a.listeners[i] = listeningAlerts{alerts: ch, done: done}
 	a.mtx.Unlock()
 
-	go func() {
-		defer func() {
-			a.mtx.Lock()
-			delete(a.listeners, i)
-			close(ch)
-			a.mtx.Unlock()
-		}()
-
-		for _, a := range alerts {
-			select {
-			case ch <- a:
-			case <-done:
-				return
-			}
-		}
-
-		<-done
-	}()
-
-	return provider.NewAlertIterator(ch, done, err)
+	return provider.NewAlertIterator(ch, done, nil)
 }
 
 // GetPending returns an iterator over all alerts that have
 // pending notifications.
 func (a *Alerts) GetPending() provider.AlertIterator {
 	var (
-		ch   = make(chan *types.Alert, 200)
+		ch   = make(chan *types.Alert, alertChannelLength)
 		done = make(chan struct{})
 	)
-
-	alerts, err := a.getPending()
 
 	go func() {
 		defer close(ch)
 
-		for _, a := range alerts {
+		for a := range a.alerts.List() {
 			select {
 			case ch <- a:
 			case <-done:
@@ -139,43 +137,23 @@ func (a *Alerts) GetPending() provider.AlertIterator {
 		}
 	}()
 
-	return provider.NewAlertIterator(ch, done, err)
-}
-
-func (a *Alerts) getPending() ([]*types.Alert, error) {
-	a.mtx.RLock()
-	defer a.mtx.RUnlock()
-
-	res := make([]*types.Alert, 0, len(a.alerts))
-
-	for _, alert := range a.alerts {
-		res = append(res, alert)
-	}
-
-	return res, nil
+	return provider.NewAlertIterator(ch, done, nil)
 }
 
 // Get returns the alert for a given fingerprint.
 func (a *Alerts) Get(fp model.Fingerprint) (*types.Alert, error) {
-	a.mtx.RLock()
-	defer a.mtx.RUnlock()
-
-	alert, ok := a.alerts[fp]
-	if !ok {
-		return nil, provider.ErrNotFound
-	}
-	return alert, nil
+	return a.alerts.Get(fp)
 }
 
 // Put adds the given alert to the set.
 func (a *Alerts) Put(alerts ...*types.Alert) error {
-	a.mtx.Lock()
-	defer a.mtx.Unlock()
 
 	for _, alert := range alerts {
 		fp := alert.Fingerprint()
 
-		if old, ok := a.alerts[fp]; ok {
+		// Check that there's an alert existing within the store before
+		// trying to merge.
+		if old, err := a.alerts.Get(fp); err == nil {
 			// Merge alerts if there is an overlap in activity range.
 			if (alert.EndsAt.After(old.StartsAt) && alert.EndsAt.Before(old.EndsAt)) ||
 				(alert.StartsAt.After(old.StartsAt) && alert.StartsAt.Before(old.EndsAt)) {
@@ -183,11 +161,19 @@ func (a *Alerts) Put(alerts ...*types.Alert) error {
 			}
 		}
 
-		a.alerts[fp] = alert
-
-		for _, ch := range a.listeners {
-			ch <- alert
+		if err := a.alerts.Set(alert); err != nil {
+			level.Error(a.logger).Log("msg", "error on set alert", "err", err)
+			continue
 		}
+
+		a.mtx.Lock()
+		for _, l := range a.listeners {
+			select {
+			case l.alerts <- alert:
+			case <-l.done:
+			}
+		}
+		a.mtx.Unlock()
 	}
 
 	return nil

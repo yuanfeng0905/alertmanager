@@ -30,6 +30,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/matttproud/golang_protobuf_extensions/pbutil"
+	"github.com/prometheus/alertmanager/cluster"
 	pb "github.com/prometheus/alertmanager/nflog/nflogpb"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -90,12 +91,13 @@ type Log struct {
 }
 
 type metrics struct {
-	gcDuration       prometheus.Summary
-	snapshotDuration prometheus.Summary
-	snapshotSize     prometheus.Gauge
-	queriesTotal     prometheus.Counter
-	queryErrorsTotal prometheus.Counter
-	queryDuration    prometheus.Histogram
+	gcDuration              prometheus.Summary
+	snapshotDuration        prometheus.Summary
+	snapshotSize            prometheus.Gauge
+	queriesTotal            prometheus.Counter
+	queryErrorsTotal        prometheus.Counter
+	queryDuration           prometheus.Histogram
+	propagatedMessagesTotal prometheus.Counter
 }
 
 func newMetrics(r prometheus.Registerer) *metrics {
@@ -125,14 +127,20 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		Name: "alertmanager_nflog_query_duration_seconds",
 		Help: "Duration of notification log query evaluation.",
 	})
+	m.propagatedMessagesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_nflog_gossip_messages_propagated_total",
+		Help: "Number of received gossip messages that have been further gossiped.",
+	})
 
 	if r != nil {
 		r.MustRegister(
 			m.gcDuration,
 			m.snapshotDuration,
+			m.snapshotSize,
 			m.queriesTotal,
 			m.queryErrorsTotal,
 			m.queryDuration,
+			m.propagatedMessagesTotal,
 		)
 	}
 	return m
@@ -216,13 +224,17 @@ func (s state) clone() state {
 	return c
 }
 
-func (s state) merge(e *pb.MeshEntry) {
+// merge returns true or false whether the MeshEntry was merged or
+// not. This information is used to decide to gossip the message further.
+func (s state) merge(e *pb.MeshEntry) bool {
 	k := stateKey(string(e.Entry.GroupKey), e.Entry.Receiver)
 
 	prev, ok := s[k]
 	if !ok || prev.Entry.Timestamp.Before(e.Entry.Timestamp) {
 		s[k] = e
+		return true
 	}
+	return false
 }
 
 func (s state) MarshalBinary() ([]byte, error) {
@@ -512,7 +524,15 @@ func (l *Log) Merge(b []byte) error {
 	defer l.mtx.Unlock()
 
 	for _, e := range st {
-		l.st.merge(e)
+		if merged := l.st.merge(e); merged && !cluster.OversizedMessage(b) {
+			// If this is the first we've seen the message and it's
+			// not oversized, gossip it to other nodes. We don't
+			// propagate oversized messages because they're sent to
+			// all nodes already.
+			l.broadcast(b)
+			l.metrics.propagatedMessagesTotal.Inc()
+			level.Debug(l.logger).Log("msg", "gossiping new entry", "entry", e)
+		}
 	}
 	return nil
 }

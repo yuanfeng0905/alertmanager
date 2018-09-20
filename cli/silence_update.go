@@ -1,3 +1,16 @@
+// Copyright 2018 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package cli
 
 import (
@@ -31,15 +44,15 @@ func configureSilenceUpdateCmd(cc *kingpin.CmdClause) {
 	)
 	updateCmd.Flag("quiet", "Only show silence ids").Short('q').BoolVar(&c.quiet)
 	updateCmd.Flag("duration", "Duration of silence").Short('d').StringVar(&c.duration)
-	updateCmd.Flag("start", "Set when the silence should start. RFC3339 format 2006-01-02T15:04:05Z07:00").StringVar(&c.start)
-	updateCmd.Flag("end", "Set when the silence should end (overwrites duration). RFC3339 format 2006-01-02T15:04:05Z07:00").StringVar(&c.end)
+	updateCmd.Flag("start", "Set when the silence should start. RFC3339 format 2006-01-02T15:04:05-07:00").StringVar(&c.start)
+	updateCmd.Flag("end", "Set when the silence should end (overwrites duration). RFC3339 format 2006-01-02T15:04:05-07:00").StringVar(&c.end)
 	updateCmd.Flag("comment", "A comment to help describe the silence").Short('c').StringVar(&c.comment)
 	updateCmd.Arg("update-ids", "Silence IDs to update").StringsVar(&c.ids)
 
-	updateCmd.Action(c.update)
+	updateCmd.Action(execWithTimeout(c.update))
 }
 
-func (c *silenceUpdateCmd) update(ctx *kingpin.ParseContext) error {
+func (c *silenceUpdateCmd) update(ctx context.Context, _ *kingpin.ParseContext) error {
 	if len(c.ids) < 1 {
 		return fmt.Errorf("no silence IDs specified")
 	}
@@ -52,7 +65,7 @@ func (c *silenceUpdateCmd) update(ctx *kingpin.ParseContext) error {
 
 	var updatedSilences []types.Silence
 	for _, silenceID := range c.ids {
-		silence, err := silenceAPI.Get(context.Background(), silenceID)
+		silence, err := silenceAPI.Get(ctx, silenceID)
 		if err != nil {
 			return err
 		}
@@ -87,7 +100,7 @@ func (c *silenceUpdateCmd) update(ctx *kingpin.ParseContext) error {
 			silence.Comment = c.comment
 		}
 
-		newID, err := silenceAPI.Set(context.Background(), *silence)
+		newID, err := silenceAPI.Set(ctx, *silence)
 		if err != nil {
 			return err
 		}
@@ -105,7 +118,9 @@ func (c *silenceUpdateCmd) update(ctx *kingpin.ParseContext) error {
 		if !found {
 			return fmt.Errorf("unknown output formatter")
 		}
-		formatter.FormatSilences(updatedSilences)
+		if err := formatter.FormatSilences(updatedSilences); err != nil {
+			return fmt.Errorf("error formatting silences: %v", err)
+		}
 	}
 	return nil
 }
