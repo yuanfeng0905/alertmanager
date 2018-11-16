@@ -1,17 +1,29 @@
 ---
-version: 2
+version: 2.1
+
+executors:
+  # Whenever the Go version is updated here, .travis.yml and .promu.yml
+  # should also be updated.
+  golang:
+    docker:
+    - image: circleci/golang:1.11
+    working_directory: /go/src/github.com/prometheus/alertmanager
 
 jobs:
   test:
-    docker:
-    - image: circleci/golang:1.10
-    working_directory: /go/src/github.com/prometheus/alertmanager
+    executor: golang
 
     steps:
     - checkout
     - setup_remote_docker
     - run: make promu
     - run: make
+    - store_artifacts:
+        path: alertmanager
+        destination: /build/alertmanager
+    - store_artifacts:
+        path: amtool
+        destination: /build/amtool
     - run: rm -v alertmanager amtool
 
   build:
@@ -26,11 +38,12 @@ jobs:
         root: .
         paths:
         - .build
+    - store_artifacts:
+        path: .build
+        destination: /build
 
   docker_hub_master:
-    docker:
-    - image: circleci/golang:1.10
-    working_directory: /go/src/github.com/prometheus/alertmanager
+    executor: golang
 
     steps:
     - checkout
@@ -48,9 +61,7 @@ jobs:
     - run: make docker-publish DOCKER_REPO=quay.io/prometheus
 
   docker_hub_release_tags:
-    docker:
-    - image: circleci/golang:1.10
-    working_directory: /go/src/github.com/prometheus/alertmanager
+    executor: golang
 
     steps:
     - checkout

@@ -51,7 +51,7 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 	return json.Marshal("<secret>")
 }
 
-// URL is a custom type that allows validation at configuration load time.
+// URL is a custom type that represents an HTTP or HTTPS URL and allows validation at configuration load time.
 type URL struct {
 	*url.URL
 }
@@ -76,11 +76,11 @@ func (u *URL) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err := unmarshal(&s); err != nil {
 		return err
 	}
-	urlp, err := url.Parse(s)
+	urlp, err := parseURL(s)
 	if err != nil {
 		return err
 	}
-	u.URL = urlp
+	u.URL = urlp.URL
 	return nil
 }
 
@@ -98,11 +98,11 @@ func (u *URL) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
-	urlp, err := url.Parse(s)
+	urlp, err := parseURL(s)
 	if err != nil {
 		return err
 	}
-	u.URL = urlp
+	u.URL = urlp.URL
 	return nil
 }
 
@@ -383,6 +383,27 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 				voc.APIKey = c.Global.VictorOpsAPIKey
 			}
 		}
+		// -------------------------------------------------------
+		// add dingtalk config parse etc.
+		// -------------------------------------------------------
+		for _, dc := range rcv.DingtalkConfigs {
+			if c.Global.DingtalkGroupToken == nil {
+				return fmt.Errorf("no global Dingtalk group_token set")
+			}
+			dc.GroupToken = c.Global.DingtalkGroupToken
+
+			if dc.HTTPConfig == nil {
+				dc.HTTPConfig = c.Global.HTTPConfig
+			}
+
+			if dc.APIURL == nil {
+				if c.Global.DingtalkAPIURL == nil {
+					return fmt.Errorf("no global Dingtalk API URL set")
+				}
+				dc.APIURL = c.Global.DingtalkAPIURL
+			}
+		}
+
 		names[rcv.Name] = struct{}{}
 	}
 
@@ -431,14 +452,29 @@ var DefaultGlobalConfig = GlobalConfig{
 	OpsGenieAPIURL:  mustParseURL("https://api.opsgenie.com/"),
 	WeChatAPIURL:    mustParseURL("https://qyapi.weixin.qq.com/cgi-bin/"),
 	VictorOpsAPIURL: mustParseURL("https://alert.victorops.com/integrations/generic/20131114/alert/"),
+	DingtalkAPIURL:  mustParseURL("https://oapi.dingtalk.com/robot/send/"),
 }
 
 func mustParseURL(s string) *URL {
-	u, err := url.Parse(s)
+	u, err := parseURL(s)
 	if err != nil {
 		panic(err)
 	}
-	return &URL{u}
+	return u
+}
+
+func parseURL(s string) (*URL, error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q for URL", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("missing host for URL")
+	}
+	return &URL{u}, nil
 }
 
 // GlobalConfig defines configuration parameters that are valid globally
@@ -469,6 +505,9 @@ type GlobalConfig struct {
 	WeChatAPICorpID  string     `yaml:"wechat_api_corp_id,omitempty" json:"wechat_api_corp_id,omitempty"`
 	VictorOpsAPIURL  *URL       `yaml:"victorops_api_url,omitempty" json:"victorops_api_url,omitempty"`
 	VictorOpsAPIKey  Secret     `yaml:"victorops_api_key,omitempty" json:"victorops_api_key,omitempty"`
+	// dingtalk api url
+	DingtalkAPIURL     *URL              `yaml:"dingtalk_api_url,omitempty" json:"dingtalk_api_url,omitempty"`
+	DingtalkGroupToken map[string]string `yaml:"dingtalk_group_token,omitempty" json:"dingtalk_group_token,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -600,6 +639,7 @@ type Receiver struct {
 	WechatConfigs    []*WechatConfig    `yaml:"wechat_configs,omitempty" json:"wechat_configs,omitempty"`
 	PushoverConfigs  []*PushoverConfig  `yaml:"pushover_configs,omitempty" json:"pushover_configs,omitempty"`
 	VictorOpsConfigs []*VictorOpsConfig `yaml:"victorops_configs,omitempty" json:"victorops_configs,omitempty"`
+	DingtalkConfigs  []*DingtalkConfig  `yaml:"dingtalk_configs,omitempty" json:"dingtalk_configs,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.

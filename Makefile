@@ -17,43 +17,27 @@ FRONTEND_DIR             = $(BIN_DIR)/ui/app
 DOCKER_IMAGE_NAME       ?= alertmanager
 ERRCHECK_BINARY         := $(FIRST_GOPATH)/bin/errcheck
 
-ifdef DEBUG
-	bindata_flags = -debug
-endif
-
 STATICCHECK_IGNORE = \
   github.com/prometheus/alertmanager/notify/notify.go:SA6002
 
 
 .PHONY: build-all
 # Will build both the front-end as well as the back-end
-build-all: assets build
+build-all: assets apiv2 build
 
-assets: go-bindata ui/bindata.go template/internal/deftmpl/bindata.go api/v2/models api/v2/restapi test/with_api_v2/api_v2_client/models test/with_api_v2/api_v2_client/client
+assets: ui/app/script.js ui/app/index.html ui/app/lib template/default.tmpl
+	cd $(PREFIX)/asset && $(GO) generate
+	@$(GOFMT) -w ./asset
 
-go-bindata:
-	-@$(GO) get -u github.com/jteeuwen/go-bindata/...
-
-template/internal/deftmpl/bindata.go: template/default.tmpl
-	@go-bindata $(bindata_flags) -mode 420 -modtime 1 -pkg deftmpl -o template/internal/deftmpl/bindata.go template/default.tmpl
-	@$(GO) fmt ./template/internal/deftmpl
-
-ui/bindata.go: ui/app/script.js ui/app/index.html ui/app/lib
-# Using "-mode 420" and "-modtime 1" to make assets make target deterministic.
-# It sets all file permissions and time stamps to 420 and 1
-	@go-bindata $(bindata_flags) -mode 420 -modtime 1 -pkg ui -o \
-		ui/bindata.go ui/app/script.js \
-		ui/app/index.html \
-		ui/app/favicon.ico \
-		ui/app/lib/...
-	@$(GO) fmt ./ui
-
-ui/app/script.js: $(shell find ui/app/src -iname *.elm)
+ui/app/script.js: $(shell find ui/app/src -iname *.elm) api/v2/openapi.yaml
 	cd $(FRONTEND_DIR) && $(MAKE) script.js
 
 .PHONY: proto
 proto:
 	scripts/genproto.sh
+
+.PHONY: apiv2
+apiv2: api/v2/models api/v2/restapi test/with_api_v2/api_v2_client/models test/with_api_v2/api_v2_client/client
 
 SWAGGER = docker run \
 	--user=$(shell id -u $(USER)):$(shell id -g $(USER)) \
@@ -71,8 +55,8 @@ test/with_api_v2/api_v2_client/models test/with_api_v2/api_v2_client/client: api
 
 .PHONY: clean
 clean:
-	rm template/internal/deftmpl/bindata.go
-	rm ui/bindata.go
+	rm -f asset/assets_vfsdata.go
+	rm -r api/v2/models api/v2/restapi test/with_api_v2/api_v2_client/models test/with_api_v2/api_v2_client/client
 	cd $(FRONTEND_DIR) && $(MAKE) clean
 
 .PHONY: test

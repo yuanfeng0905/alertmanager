@@ -15,14 +15,17 @@ package notify
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
@@ -37,8 +40,6 @@ import (
 	commoncfg "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/version"
-	"golang.org/x/net/context"
-	"golang.org/x/net/context/ctxhttp"
 
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/template"
@@ -117,6 +118,11 @@ func BuildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, log
 		n := NewPushover(c, tmpl, logger)
 		add("pushover", i, n, c)
 	}
+	// add dingtalk plugin
+	for i, c := range nc.DingtalkConfigs {
+		n := NewDingtalk(c, tmpl, logger)
+		add("dingtalk", i, n, c)
+	}
 	return integrations
 }
 
@@ -177,7 +183,7 @@ func (w *Webhook) Notify(ctx context.Context, alerts ...*types.Alert) (bool, err
 		return false, err
 	}
 
-	resp, err := ctxhttp.Do(ctx, c, req)
+	resp, err := c.Do(req.WithContext(ctx))
 	if err != nil {
 		return true, err
 	}
@@ -220,12 +226,13 @@ func NewEmail(c *config.EmailConfig, t *template.Template, l log.Logger) *Email 
 // auth resolves a string of authentication mechanisms.
 func (n *Email) auth(mechs string) (smtp.Auth, error) {
 	username := n.conf.AuthUsername
-
+	err := &types.MultiError{}
 	for _, mech := range strings.Split(mechs, " ") {
 		switch mech {
 		case "CRAM-MD5":
 			secret := string(n.conf.AuthSecret)
 			if secret == "" {
+				err.Add(errors.New("missing secret for CRAM-MD5 auth mechanism"))
 				continue
 			}
 			return smtp.CRAMMD5Auth(username, secret), nil
@@ -233,6 +240,7 @@ func (n *Email) auth(mechs string) (smtp.Auth, error) {
 		case "PLAIN":
 			password := string(n.conf.AuthPassword)
 			if password == "" {
+				err.Add(errors.New("missing password for PLAIN auth mechanism"))
 				continue
 			}
 			identity := n.conf.AuthIdentity
@@ -246,12 +254,16 @@ func (n *Email) auth(mechs string) (smtp.Auth, error) {
 		case "LOGIN":
 			password := string(n.conf.AuthPassword)
 			if password == "" {
+				err.Add(errors.New("missing password for LOGIN auth mechanism"))
 				continue
 			}
 			return LoginAuth(username, password), nil
 		}
 	}
-	return nil, nil
+	if err.Len() == 0 {
+		err.Add(errors.New("unknown auth mechanism: " + mechs))
+	}
+	return nil, err
 }
 
 // Notify implements the Notifier interface.
@@ -391,7 +403,10 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 
 	if len(n.conf.Text) > 0 {
 		// Text template
-		w, err := multipartWriter.CreatePart(textproto.MIMEHeader{"Content-Type": {"text/plain; charset=UTF-8"}})
+		w, err := multipartWriter.CreatePart(textproto.MIMEHeader{
+			"Content-Transfer-Encoding": {"quoted-printable"},
+			"Content-Type":              {"text/plain; charset=UTF-8"},
+		})
 		if err != nil {
 			return false, fmt.Errorf("creating part for text template: %s", err)
 		}
@@ -399,7 +414,12 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("executing email text template: %s", err)
 		}
-		_, err = w.Write([]byte(body))
+		qw := quotedprintable.NewWriter(w)
+		_, err = qw.Write([]byte(body))
+		if err != nil {
+			return true, err
+		}
+		err = qw.Close()
 		if err != nil {
 			return true, err
 		}
@@ -409,7 +429,10 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		// Html template
 		// Preferred alternative placed last per section 5.1.4 of RFC 2046
 		// https://www.ietf.org/rfc/rfc2046.txt
-		w, err := multipartWriter.CreatePart(textproto.MIMEHeader{"Content-Type": {"text/html; charset=UTF-8"}})
+		w, err := multipartWriter.CreatePart(textproto.MIMEHeader{
+			"Content-Transfer-Encoding": {"quoted-printable"},
+			"Content-Type":              {"text/html; charset=UTF-8"},
+		})
 		if err != nil {
 			return false, fmt.Errorf("creating part for html template: %s", err)
 		}
@@ -417,7 +440,12 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("executing email html template: %s", err)
 		}
-		_, err = w.Write([]byte(body))
+		qw := quotedprintable.NewWriter(w)
+		_, err = qw.Write([]byte(body))
+		if err != nil {
+			return true, err
+		}
+		err = qw.Close()
 		if err != nil {
 			return true, err
 		}
@@ -465,6 +493,19 @@ type pagerDutyMessage struct {
 	Client      string            `json:"client,omitempty"`
 	ClientURL   string            `json:"client_url,omitempty"`
 	Details     map[string]string `json:"details,omitempty"`
+	Images      []pagerDutyImage  `json:"images,omitempty"`
+	Links       []pagerDutyLink   `json:"links,omitempty"`
+}
+
+type pagerDutyLink struct {
+	HRef string `json:"href"`
+	Text string `json:"text"`
+}
+
+type pagerDutyImage struct {
+	Src  string `json:"src"`
+	Alt  string `json:"alt"`
+	Text string `json:"text"`
 }
 
 type pagerDutyPayload struct {
@@ -517,7 +558,7 @@ func (n *PagerDuty) notifyV1(
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, c, n.conf.URL.String(), contentTypeJSON, &buf)
+	resp, err := post(ctx, c, n.conf.URL.String(), contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -547,6 +588,8 @@ func (n *PagerDuty) notifyV2(
 		RoutingKey:  tmpl(string(n.conf.RoutingKey)),
 		EventAction: eventType,
 		DedupKey:    hashKey(key),
+		Images:      make([]pagerDutyImage, len(n.conf.Images)),
+		Links:       make([]pagerDutyLink, len(n.conf.Links)),
 		Payload: &pagerDutyPayload{
 			Summary:       tmpl(n.conf.Description),
 			Source:        tmpl(n.conf.Client),
@@ -558,6 +601,17 @@ func (n *PagerDuty) notifyV2(
 		},
 	}
 
+	for index, item := range n.conf.Images {
+		msg.Images[index].Src = tmpl(item.Src)
+		msg.Images[index].Alt = tmpl(item.Alt)
+		msg.Images[index].Text = tmpl(item.Text)
+	}
+
+	for index, item := range n.conf.Links {
+		msg.Links[index].HRef = tmpl(item.HRef)
+		msg.Links[index].Text = tmpl(item.Text)
+	}
+
 	if tmplErr != nil {
 		return false, fmt.Errorf("failed to template PagerDuty v2 message: %v", tmplErr)
 	}
@@ -567,7 +621,7 @@ func (n *PagerDuty) notifyV2(
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, c, n.conf.URL.String(), contentTypeJSON, &buf)
+	resp, err := post(ctx, c, n.conf.URL.String(), contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -680,16 +734,17 @@ type slackReq struct {
 
 // slackAttachment is used to display a richly-formatted message block.
 type slackAttachment struct {
-	Title     string               `json:"title,omitempty"`
-	TitleLink string               `json:"title_link,omitempty"`
-	Pretext   string               `json:"pretext,omitempty"`
-	Text      string               `json:"text"`
-	Fallback  string               `json:"fallback"`
-	Fields    []config.SlackField  `json:"fields,omitempty"`
-	Actions   []config.SlackAction `json:"actions,omitempty"`
-	ImageURL  string               `json:"image_url,omitempty"`
-	ThumbURL  string               `json:"thumb_url,omitempty"`
-	Footer    string               `json:"footer"`
+	Title      string               `json:"title,omitempty"`
+	TitleLink  string               `json:"title_link,omitempty"`
+	Pretext    string               `json:"pretext,omitempty"`
+	Text       string               `json:"text"`
+	Fallback   string               `json:"fallback"`
+	CallbackID string               `json:"callback_id"`
+	Fields     []config.SlackField  `json:"fields,omitempty"`
+	Actions    []config.SlackAction `json:"actions,omitempty"`
+	ImageURL   string               `json:"image_url,omitempty"`
+	ThumbURL   string               `json:"thumb_url,omitempty"`
+	Footer     string               `json:"footer"`
 
 	Color    string   `json:"color,omitempty"`
 	MrkdwnIn []string `json:"mrkdwn_in,omitempty"`
@@ -704,16 +759,17 @@ func (n *Slack) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	)
 
 	attachment := &slackAttachment{
-		Title:     tmplText(n.conf.Title),
-		TitleLink: tmplText(n.conf.TitleLink),
-		Pretext:   tmplText(n.conf.Pretext),
-		Text:      tmplText(n.conf.Text),
-		Fallback:  tmplText(n.conf.Fallback),
-		ImageURL:  tmplText(n.conf.ImageURL),
-		ThumbURL:  tmplText(n.conf.ThumbURL),
-		Footer:    tmplText(n.conf.Footer),
-		Color:     tmplText(n.conf.Color),
-		MrkdwnIn:  []string{"fallback", "pretext", "text"},
+		Title:      tmplText(n.conf.Title),
+		TitleLink:  tmplText(n.conf.TitleLink),
+		Pretext:    tmplText(n.conf.Pretext),
+		Text:       tmplText(n.conf.Text),
+		Fallback:   tmplText(n.conf.Fallback),
+		CallbackID: tmplText(n.conf.CallbackID),
+		ImageURL:   tmplText(n.conf.ImageURL),
+		ThumbURL:   tmplText(n.conf.ThumbURL),
+		Footer:     tmplText(n.conf.Footer),
+		Color:      tmplText(n.conf.Color),
+		MrkdwnIn:   []string{"fallback", "pretext", "text"},
 	}
 
 	var numFields = len(n.conf.Fields)
@@ -742,12 +798,25 @@ func (n *Slack) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	if numActions > 0 {
 		var actions = make([]config.SlackAction, numActions)
 		for index, action := range n.conf.Actions {
-			actions[index] = config.SlackAction{
+			slackAction := config.SlackAction{
 				Type:  tmplText(action.Type),
 				Text:  tmplText(action.Text),
 				URL:   tmplText(action.URL),
 				Style: tmplText(action.Style),
+				Name:  tmplText(action.Name),
+				Value: tmplText(action.Value),
 			}
+
+			if action.ConfirmField != nil {
+				slackAction.ConfirmField = &config.SlackConfirmationField{
+					Title:       tmplText(action.ConfirmField.Title),
+					Text:        tmplText(action.ConfirmField.Text),
+					OkText:      tmplText(action.ConfirmField.OkText),
+					DismissText: tmplText(action.ConfirmField.DismissText),
+				}
+			}
+
+			actions[index] = slackAction
 		}
 		attachment.Actions = actions
 	}
@@ -774,7 +843,7 @@ func (n *Slack) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, c, n.conf.APIURL.String(), contentTypeJSON, &buf)
+	resp, err := post(ctx, c, n.conf.APIURL.String(), contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -861,7 +930,7 @@ func (n *Hipchat) Notify(ctx context.Context, as ...*types.Alert) (bool, error) 
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, c, apiURL.String(), contentTypeJSON, &buf)
+	resp, err := post(ctx, c, apiURL.String(), contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -1088,7 +1157,7 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		return false, err
 	}
 
-	resp, err := ctxhttp.Do(ctx, c, req)
+	resp, err := c.Do(req.WithContext(ctx))
 
 	if err != nil {
 		return true, err
@@ -1167,6 +1236,9 @@ func (n *OpsGenie) createRequest(ctx context.Context, as ...*types.Alert) (*http
 			Priority:    tmpl(n.conf.Priority),
 		}
 	}
+
+	apiKey := tmpl(string(n.conf.APIKey))
+
 	if err != nil {
 		return nil, false, fmt.Errorf("templating error: %s", err)
 	}
@@ -1181,7 +1253,7 @@ func (n *OpsGenie) createRequest(ctx context.Context, as ...*types.Alert) (*http
 		return nil, true, err
 	}
 	req.Header.Set("Content-Type", contentTypeJSON)
-	req.Header.Set("Authorization", fmt.Sprintf("GenieKey %s", n.conf.APIKey))
+	req.Header.Set("Authorization", fmt.Sprintf("GenieKey %s", apiKey))
 	return req, true, nil
 }
 
@@ -1285,7 +1357,7 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, c, apiURL.String(), contentTypeJSON, &buf)
+	resp, err := post(ctx, c, apiURL.String(), contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -1382,7 +1454,7 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, c, u.String(), "text/plain", nil)
+	resp, err := post(ctx, c, u.String(), "text/plain", nil)
 	if err != nil {
 		return true, err
 	}
@@ -1461,4 +1533,101 @@ func hashKey(s string) string {
 	h := sha256.New()
 	h.Write([]byte(s))
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func post(ctx context.Context, client *http.Client, url string, bodyType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", bodyType)
+	return client.Do(req.WithContext(ctx))
+}
+
+// ----------------------------------------------------------------------
+// add Dingtalk notify plugin
+// ----------------------------------------------------------------------
+type Dingtalk struct {
+	conf   *config.DingtalkConfig
+	tmpl   *template.Template
+	logger log.Logger
+}
+
+type TextContent struct {
+	Content string `json:"content"`
+}
+
+type AtContent struct {
+	AtMobiles []string `json:"atMobiles"`
+	IsAtAll   bool     `json:"isAtAll"`
+}
+
+type DingtalkMessage struct {
+	Msgtype string      `json:"msgtype"`
+	Text    TextContent `json:"text"`
+	At      *AtContent  `json:"at"`
+}
+
+func NewDingtalk(conf *config.DingtalkConfig, tmpl *template.Template, l log.Logger) *Dingtalk {
+	return &Dingtalk{conf: conf, tmpl: tmpl, logger: l}
+}
+
+// Notify implements the Notifier interface.
+func (d *Dingtalk) Notify(ctx context.Context, alerts ...*types.Alert) (bool, error) {
+	var tmplErr error
+	data := d.tmpl.Data(receiverName(ctx, d.logger), groupLabels(ctx, d.logger), alerts...)
+	tmpl := tmplText(d.tmpl, data, &tmplErr)
+
+	token := d.conf.Token
+	if token == "" {
+		token, _ = d.conf.GroupToken[d.conf.Group]
+	}
+	if token == "" {
+		level.Error(d.logger).Log("msg", "invalid group")
+		return false, fmt.Errorf("invalid group=%s", d.conf.Group)
+	}
+
+	msg := DingtalkMessage{
+		Msgtype: "text",
+		Text:    TextContent{Content: tmpl(d.conf.Content)},
+		At:      &AtContent{IsAtAll: true},
+	}
+	if tmplErr != nil {
+		return false, fmt.Errorf("failed to template: %v", tmplErr)
+	}
+
+	var msgBuf bytes.Buffer
+	if err := json.NewEncoder(&msgBuf).Encode(msg); err != nil {
+		return false, err
+	}
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s?access_token=%s",
+		config.DefaultGlobalConfig.DingtalkAPIURL.String(), token), &msgBuf)
+	if err != nil {
+		return true, err
+	}
+	req.Header.Set("Content-Type", contentTypeJSON)
+	req.Header.Set("User-Agent", userAgentHeader)
+
+	c, err := commoncfg.NewClientFromConfig(*d.conf.HTTPConfig, "dingtalk")
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := c.Do(req.WithContext(ctx))
+	if err != nil {
+		return true, err
+	}
+	resp.Body.Close()
+
+	return d.retry(resp.StatusCode)
+}
+
+func (d *Dingtalk) retry(statusCode int) (bool, error) {
+	// Webhooks are assumed to respond with 2xx response codes on a successful
+	// request and 5xx response codes are assumed to be recoverable.
+	if statusCode/100 != 2 {
+		return (statusCode/100 == 5), fmt.Errorf("unexpected status code %v from %s", statusCode, d.conf.APIURL)
+	}
+
+	return false, nil
 }

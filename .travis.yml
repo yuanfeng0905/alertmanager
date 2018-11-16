@@ -4,14 +4,16 @@ language: go
 services:
 - docker
 
+# Whenever the Go version is updated here, .circleci/config.yml and .promu.yml
+# should also be updated.
 go:
-- 1.10.x
+- 1.11.x
 
 script:
 # test front-end
 - make clean
 - cd ui/app/ && make && cd ../..
-- make assets
+- make assets apiv2
 - git diff --exit-code
 # test back-end
 - make
