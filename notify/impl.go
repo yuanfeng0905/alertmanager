@@ -900,7 +900,7 @@ func (n *Hipchat) Notify(ctx context.Context, as ...*types.Alert) (bool, error) 
 	)
 	apiURL.Path += fmt.Sprintf("v2/room/%s/notification", roomid)
 	q := apiURL.Query()
-	q.Set("auth_token", fmt.Sprintf("%s", n.conf.AuthToken))
+	q.Set("auth_token", string(n.conf.AuthToken))
 	apiURL.RawQuery = q.Encode()
 
 	if n.conf.MessageFormat == "html" {
@@ -1012,7 +1012,7 @@ func (n *Wechat) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	}
 
 	// Refresh AccessToken over 2 hours
-	if n.accessToken == "" || time.Now().Sub(n.accessTokenAt) > 2*time.Hour {
+	if n.accessToken == "" || time.Since(n.accessTokenAt) > 2*time.Hour {
 		parameters := url.Values{}
 		parameters.Add("corpsecret", tmpl(string(n.conf.APISecret)))
 		parameters.Add("corpid", tmpl(string(n.conf.CorpID)))
@@ -1290,16 +1290,39 @@ const (
 	victorOpsEventResolve = "RECOVERY"
 )
 
-type victorOpsMessage struct {
-	MessageType       string `json:"message_type"`
-	EntityID          string `json:"entity_id"`
-	EntityDisplayName string `json:"entity_display_name"`
-	StateMessage      string `json:"state_message"`
-	MonitoringTool    string `json:"monitoring_tool"`
-}
-
 // Notify implements the Notifier interface.
 func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
+
+	var err error
+	var (
+		data   = n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
+		tmpl   = tmplText(n.tmpl, data, &err)
+		apiURL = n.conf.APIURL.Copy()
+	)
+	apiURL.Path += fmt.Sprintf("%s/%s", n.conf.APIKey, tmpl(n.conf.RoutingKey))
+
+	c, err := commoncfg.NewClientFromConfig(*n.conf.HTTPConfig, "victorops")
+	if err != nil {
+		return false, err
+	}
+
+	buf, err := n.createVictorOpsPayload(ctx, as...)
+	if err != nil {
+		return true, err
+	}
+
+	resp, err := post(ctx, c, apiURL.String(), contentTypeJSON, buf)
+	if err != nil {
+		return true, err
+	}
+
+	defer resp.Body.Close()
+
+	return n.retry(resp.StatusCode)
+}
+
+// Create the JSON payload to be sent to the VictorOps API.
+func (n *VictorOps) createVictorOpsPayload(ctx context.Context, as ...*types.Alert) (*bytes.Buffer, error) {
 	victorOpsAllowedEvents := map[string]bool{
 		"INFO":     true,
 		"WARNING":  true,
@@ -1308,19 +1331,18 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 
 	key, ok := GroupKey(ctx)
 	if !ok {
-		return false, fmt.Errorf("group key missing")
+		return nil, fmt.Errorf("group key missing")
 	}
 
 	var err error
 	var (
-		alerts       = types.Alerts(as...)
-		data         = n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
-		tmpl         = tmplText(n.tmpl, data, &err)
-		apiURL       = n.conf.APIURL.Copy()
+		alerts = types.Alerts(as...)
+		data   = n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
+		tmpl   = tmplText(n.tmpl, data, &err)
+
 		messageType  = tmpl(n.conf.MessageType)
 		stateMessage = tmpl(n.conf.StateMessage)
 	)
-	apiURL.Path += fmt.Sprintf("%s/%s", n.conf.APIKey, tmpl(n.conf.RoutingKey))
 
 	if alerts.Status() == model.AlertFiring && !victorOpsAllowedEvents[messageType] {
 		messageType = victorOpsEventTrigger
@@ -1335,36 +1357,31 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		level.Debug(n.logger).Log("msg", "Truncated stateMessage due to VictorOps stateMessage limit", "truncated_state_message", stateMessage, "incident", key)
 	}
 
-	msg := &victorOpsMessage{
-		MessageType:       messageType,
-		EntityID:          hashKey(key),
-		EntityDisplayName: tmpl(n.conf.EntityDisplayName),
-		StateMessage:      stateMessage,
-		MonitoringTool:    tmpl(n.conf.MonitoringTool),
+	msg := map[string]string{
+		"message_type":        messageType,
+		"entity_id":           hashKey(key),
+		"entity_display_name": tmpl(n.conf.EntityDisplayName),
+		"state_message":       stateMessage,
+		"monitoring_tool":     tmpl(n.conf.MonitoringTool),
 	}
 
 	if err != nil {
-		return false, fmt.Errorf("templating error: %s", err)
+		return nil, fmt.Errorf("templating error: %s", err)
+	}
+
+	// Add custom fields to the payload.
+	for k, v := range n.conf.CustomFields {
+		msg[k] = tmpl(v)
+		if err != nil {
+			return nil, fmt.Errorf("templating error: %s", err)
+		}
 	}
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return false, err
+		return nil, err
 	}
-
-	c, err := commoncfg.NewClientFromConfig(*n.conf.HTTPConfig, "victorops")
-	if err != nil {
-		return false, err
-	}
-
-	resp, err := post(ctx, c, apiURL.String(), contentTypeJSON, &buf)
-	if err != nil {
-		return true, err
-	}
-
-	defer resp.Body.Close()
-
-	return n.retry(resp.StatusCode)
+	return &buf, nil
 }
 
 func (n *VictorOps) retry(statusCode int) (bool, error) {

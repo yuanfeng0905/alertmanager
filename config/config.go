@@ -44,7 +44,7 @@ func init() {
 // Secret is a string that must not be revealed on marshaling.
 type Secret string
 
-// MarshalYAML implements the yaml.Marshaler interface.
+// MarshalYAML implements the yaml.Marshaler interface for Secret.
 func (s Secret) MarshalYAML() (interface{}, error) {
 	if s != "" {
 		return secretToken, nil
@@ -58,7 +58,7 @@ func (s *Secret) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return unmarshal((*plain)(s))
 }
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the json.Marshaler interface for Secret.
 func (s Secret) MarshalJSON() ([]byte, error) {
 	return json.Marshal(secretToken)
 }
@@ -235,7 +235,7 @@ func (c Config) String() string {
 	return string(b)
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Config.
 func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// We want to set c to the defaults and then overwrite it with the input.
 	// To make unmarshal fill the plain data struct rather than calling UnmarshalYAML
@@ -249,7 +249,7 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// We have to restore it here.
 	if c.Global == nil {
 		c.Global = &GlobalConfig{}
-		*c.Global = DefaultGlobalConfig
+		*c.Global = DefaultGlobalConfig()
 	}
 
 	names := map[string]struct{}{}
@@ -470,19 +470,21 @@ func checkReceiver(r *Route, receivers map[string]struct{}) error {
 	return nil
 }
 
-// DefaultGlobalConfig provides global default values.
-var DefaultGlobalConfig = GlobalConfig{
-	ResolveTimeout: model.Duration(5 * time.Minute),
-	HTTPConfig:     &commoncfg.HTTPClientConfig{},
+// DefaultGlobalConfig returns GlobalConfig with default values.
+func DefaultGlobalConfig() GlobalConfig {
+	return GlobalConfig{
+		ResolveTimeout: model.Duration(5 * time.Minute),
+		HTTPConfig:     &commoncfg.HTTPClientConfig{},
 
-	SMTPHello:       "localhost",
-	SMTPRequireTLS:  true,
-	PagerdutyURL:    mustParseURL("https://events.pagerduty.com/v2/enqueue"),
-	HipchatAPIURL:   mustParseURL("https://api.hipchat.com/"),
-	OpsGenieAPIURL:  mustParseURL("https://api.opsgenie.com/"),
-	WeChatAPIURL:    mustParseURL("https://qyapi.weixin.qq.com/cgi-bin/"),
-	VictorOpsAPIURL: mustParseURL("https://alert.victorops.com/integrations/generic/20131114/alert/"),
-	DingtalkAPIURL:  mustParseURL("https://oapi.dingtalk.com/robot/send/"),
+		SMTPHello:       "localhost",
+		SMTPRequireTLS:  true,
+		PagerdutyURL:    mustParseURL("https://events.pagerduty.com/v2/enqueue"),
+		HipchatAPIURL:   mustParseURL("https://api.hipchat.com/"),
+		OpsGenieAPIURL:  mustParseURL("https://api.opsgenie.com/"),
+		WeChatAPIURL:    mustParseURL("https://qyapi.weixin.qq.com/cgi-bin/"),
+		VictorOpsAPIURL: mustParseURL("https://alert.victorops.com/integrations/generic/20131114/alert/"),
+		DingtalkAPIURL:  mustParseURL("https://oapi.dingtalk.com/robot/send/"),
+	}
 }
 
 func mustParseURL(s string) *URL {
@@ -540,9 +542,9 @@ type GlobalConfig struct {
 	DingtalkGroupToken map[string]string `yaml:"dingtalk_group_token,omitempty" json:"dingtalk_group_token,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for GlobalConfig.
 func (c *GlobalConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	*c = DefaultGlobalConfig
+	*c = DefaultGlobalConfig()
 	type plain GlobalConfig
 	return unmarshal((*plain)(c))
 }
@@ -565,7 +567,7 @@ type Route struct {
 	RepeatInterval *model.Duration `yaml:"repeat_interval,omitempty" json:"repeat_interval,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Route.
 func (r *Route) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type plain Route
 	if err := unmarshal((*plain)(r)); err != nil {
@@ -639,7 +641,7 @@ type InhibitRule struct {
 	Equal model.LabelNames `yaml:"equal,omitempty" json:"equal,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for InhibitRule.
 func (r *InhibitRule) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type plain InhibitRule
 	if err := unmarshal((*plain)(r)); err != nil {
@@ -690,7 +692,7 @@ type Receiver struct {
 	DingtalkConfigs  []*DingtalkConfig  `yaml:"dingtalk_configs,omitempty" json:"dingtalk_configs,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Receiver.
 func (c *Receiver) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type plain Receiver
 	if err := unmarshal((*plain)(c)); err != nil {
@@ -707,7 +709,7 @@ type Regexp struct {
 	*regexp.Regexp
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Regexp.
 func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
@@ -721,7 +723,7 @@ func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// MarshalYAML implements the yaml.Marshaler interface.
+// MarshalYAML implements the yaml.Marshaler interface for Regexp.
 func (re Regexp) MarshalYAML() (interface{}, error) {
 	if re.Regexp != nil {
 		return re.String(), nil
@@ -729,7 +731,7 @@ func (re Regexp) MarshalYAML() (interface{}, error) {
 	return nil, nil
 }
 
-// UnmarshalJSON implements the json.Marshaler interface
+// UnmarshalJSON implements the json.Marshaler interface for Regexp
 func (re *Regexp) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -743,7 +745,7 @@ func (re *Regexp) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the json.Marshaler interface for Regexp.
 func (re Regexp) MarshalJSON() ([]byte, error) {
 	if re.Regexp != nil {
 		return json.Marshal(re.String())
