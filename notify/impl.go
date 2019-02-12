@@ -1630,7 +1630,7 @@ func (d *Dingtalk) Notify(ctx context.Context, alerts ...*types.Alert) (bool, er
 		return false, err
 	}
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s?access_token=%s",
-		config.DefaultGlobalConfig.DingtalkAPIURL.String(), token), &msgBuf)
+		config.DefaultGlobalConfig().DingtalkAPIURL.String(), token), &msgBuf)
 	if err != nil {
 		return true, err
 	}
