@@ -377,9 +377,7 @@ func init() {
     "clusterStatus": {
       "type": "object",
       "required": [
-        "name",
-        "status",
-        "peers"
+        "status"
       ],
       "properties": {
         "name": {
@@ -387,7 +385,6 @@ func init() {
         },
         "peers": {
           "type": "array",
-          "minimum": 0,
           "items": {
             "$ref": "#/definitions/peerStatus"
           }
@@ -1085,9 +1082,7 @@ func init() {
     "clusterStatus": {
       "type": "object",
       "required": [
-        "name",
-        "status",
-        "peers"
+        "status"
       ],
       "properties": {
         "name": {

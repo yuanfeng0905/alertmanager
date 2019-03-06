@@ -56,13 +56,13 @@ type API struct {
 	getAlertStatus getAlertStatusFn
 	uptime         time.Time
 
-	// mtx protects resolveTimeout, alertmanagerConfig and route.
+	// mtx protects alertmanagerConfig, setAlertStatus and route.
 	mtx sync.RWMutex
 	// resolveTimeout represents the default resolve timeout that an alert is
 	// assigned if no end time is specified.
-	resolveTimeout     time.Duration
 	alertmanagerConfig *config.Config
 	route              *dispatch.Route
+	setAlertStatus     setAlertStatusFn
 
 	logger log.Logger
 
@@ -70,9 +70,16 @@ type API struct {
 }
 
 type getAlertStatusFn func(prometheus_model.Fingerprint) types.AlertStatus
+type setAlertStatusFn func(prometheus_model.LabelSet)
 
 // NewAPI returns a new Alertmanager API v2
-func NewAPI(alerts provider.Alerts, sf getAlertStatusFn, silences *silence.Silences, peer *cluster.Peer, l log.Logger) (*API, error) {
+func NewAPI(
+	alerts provider.Alerts,
+	sf getAlertStatusFn,
+	silences *silence.Silences,
+	peer *cluster.Peer,
+	l log.Logger,
+) (*API, error) {
 	api := API{
 		alerts:         alerts,
 		getAlertStatus: sf,
@@ -91,10 +98,11 @@ func NewAPI(alerts provider.Alerts, sf getAlertStatusFn, silences *silence.Silen
 	// create new service API
 	openAPI := operations.NewAlertmanagerAPI(swaggerSpec)
 
-	// Skip swagger spec and redoc middleware, only serving the API itself via
-	// RoutesHandler. See: https://github.com/go-swagger/go-swagger/issues/1779
+	// Skip the  redoc middleware, only serving the OpenAPI specification and
+	// the API itself via RoutesHandler. See:
+	// https://github.com/go-swagger/go-swagger/issues/1779
 	openAPI.Middleware = func(b middleware.Builder) http.Handler {
-		return middleware.Spec("", nil, openAPI.Context().RoutesHandler(b))
+		return middleware.Spec("", swaggerSpec.Raw(), openAPI.Context().RoutesHandler(b))
 	}
 
 	openAPI.AlertGetAlertsHandler = alert_ops.GetAlertsHandlerFunc(api.getAlertsHandler)
@@ -114,15 +122,14 @@ func NewAPI(alerts provider.Alerts, sf getAlertStatusFn, silences *silence.Silen
 	return &api, nil
 }
 
-// Update sets the configuration string to a new value.
-func (api *API) Update(cfg *config.Config, resolveTimeout time.Duration) error {
+// Update sets the API struct members that may change between reloads of alertmanager.
+func (api *API) Update(cfg *config.Config, setAlertStatus setAlertStatusFn) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
 
-	api.resolveTimeout = resolveTimeout
 	api.alertmanagerConfig = cfg
 	api.route = dispatch.NewRoute(cfg.Route, nil)
-	return nil
+	api.setAlertStatus = setAlertStatus
 }
 
 func (api *API) getStatusHandler(params general_ops.GetStatusParams) middleware.Responder {
@@ -132,7 +139,6 @@ func (api *API) getStatusHandler(params general_ops.GetStatusParams) middleware.
 	original := api.alertmanagerConfig.String()
 	uptime := strfmt.DateTime(api.uptime)
 
-	name := ""
 	status := open_api_models.ClusterStatusStatusDisabled
 
 	resp := open_api_models.AlertmanagerStatus{
@@ -149,15 +155,12 @@ func (api *API) getStatusHandler(params general_ops.GetStatusParams) middleware.
 			Original: &original,
 		},
 		Cluster: &open_api_models.ClusterStatus{
-			Name:   &name,
 			Status: &status,
-			Peers:  []*open_api_models.PeerStatus{},
 		},
 	}
 
 	// If alertmanager cluster feature is disabled, then api.peers == nil.
 	if api.peer != nil {
-		name := api.peer.Name()
 		status := api.peer.Status()
 
 		peers := []*open_api_models.PeerStatus{}
@@ -170,7 +173,7 @@ func (api *API) getStatusHandler(params general_ops.GetStatusParams) middleware.
 		}
 
 		resp.Cluster = &open_api_models.ClusterStatus{
-			Name:   &name,
+			Name:   api.peer.Name(),
 			Status: &status,
 			Peers:  peers,
 		}
@@ -199,6 +202,7 @@ func (api *API) getAlertsHandler(params alert_ops.GetAlertsParams) middleware.Re
 		// are no alerts present
 		res      = open_api_models.GettableAlerts{}
 		matchers = []*labels.Matcher{}
+		ctx      = params.HTTPRequest.Context()
 	)
 
 	if params.Filter != nil {
@@ -228,9 +232,11 @@ func (api *API) getAlertsHandler(params alert_ops.GetAlertsParams) middleware.Re
 	defer alerts.Close()
 
 	api.mtx.RLock()
-	// TODO(fabxc): enforce a sensible timeout.
 	for a := range alerts.Next() {
 		if err = alerts.Err(); err != nil {
+			break
+		}
+		if err = ctx.Err(); err != nil {
 			break
 		}
 
@@ -253,6 +259,10 @@ func (api *API) getAlertsHandler(params alert_ops.GetAlertsParams) middleware.Re
 			continue
 		}
 
+		// Set alert's current status based on its label set.
+		api.setAlertStatus(a.Labels)
+
+		// Get alert's current status after seeing if it is suppressed.
 		status := api.getAlertStatus(a.Fingerprint())
 
 		if !*params.Active && status.State == types.AlertStateActive {
@@ -323,7 +333,7 @@ func (api *API) postAlertsHandler(params alert_ops.PostAlertsParams) middleware.
 	now := time.Now()
 
 	api.mtx.RLock()
-	resolveTimeout := api.resolveTimeout
+	resolveTimeout := time.Duration(api.alertmanagerConfig.Global.ResolveTimeout)
 	api.mtx.RUnlock()
 
 	for _, alert := range alerts {
@@ -479,7 +489,7 @@ func (api *API) getSilencesHandler(params silence_ops.GetSilencesParams) middlew
 		}
 	}
 
-	psils, err := api.silences.Query()
+	psils, _, err := api.silences.Query()
 	if err != nil {
 		level.Error(api.logger).Log("msg", "failed to get silences", "err", err)
 		return silence_ops.NewGetSilencesInternalServerError().WithPayload(err.Error())
@@ -511,7 +521,7 @@ func gettableSilenceMatchesFilterLabels(s open_api_models.GettableSilence, match
 }
 
 func (api *API) getSilenceHandler(params silence_ops.GetSilenceParams) middleware.Responder {
-	sils, err := api.silences.Query(silence.QIDs(params.SilenceID.String()))
+	sils, _, err := api.silences.Query(silence.QIDs(params.SilenceID.String()))
 	if err != nil {
 		level.Error(api.logger).Log("msg", "failed to get silence by id", "err", err)
 		return silence_ops.NewGetSilenceInternalServerError().WithPayload(err.Error())

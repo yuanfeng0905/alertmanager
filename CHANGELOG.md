@@ -1,3 +1,7 @@
+## Next release
+
+* [CHANGE] Make api/v2/status.cluster.{name,peers} properties optional for Alertmanager with disabled clustering (#1728)
+
 ## 0.16.1 / 2019-01-31
 
 * [BUGFIX] Do not populate cluster info if clustering is disabled in API v2 (#1726)
@@ -22,7 +26,7 @@ deprecated. API v1 will be removed with Alertmanager release v0.18.0.
 * [FEATURE] Add support for images and links in the PagerDuty notification config (#1559)
 * [FEATURE] Add support for grouping by all labels (#1588)
 * [FEATURE] [amtool] Add timeout support to amtool commands (#1471)
-* [FEATURE] [amtool] Added `config routes` tools for vizualization and testing routes (#1511)
+* [FEATURE] [amtool] Added `config routes` tools for visualization and testing routes (#1511)
 * [FEATURE] [amtool] Support adding alerts using amtool (#1461)
 * [ENHANCEMENT] Add support for --log.format (#1658)
 * [ENHANCEMENT] Add CORS support to API v2 (#1667)

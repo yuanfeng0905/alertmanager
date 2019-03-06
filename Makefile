@@ -28,7 +28,7 @@ PRECHECK_OPTIONS_bzr = version
 build-all: assets apiv2 build
 
 assets: ui/app/script.js ui/app/index.html ui/app/lib template/default.tmpl
-	cd $(PREFIX)/asset && $(GO) generate
+	GO111MODULE=$(GO111MODULE) $(GO) generate ./asset
 	@$(GOFMT) -w ./asset
 
 ui/app/script.js: $(shell find ui/app/src -iname *.elm) api/v2/openapi.yaml
@@ -41,7 +41,7 @@ SWAGGER = docker run \
 	--user=$(shell id -u $(USER)):$(shell id -g $(USER)) \
 	--rm \
 	-v $(shell pwd):/go/src/github.com/prometheus/alertmanager \
-	-w /go/src/github.com/prometheus/alertmanager quay.io/goswagger/swagger:0.16.0
+	-w /go/src/github.com/prometheus/alertmanager quay.io/goswagger/swagger:v0.18.0
 
 api/v2/models api/v2/restapi: api/v2/openapi.yaml
 	-rm -r api/v2/{models,restapi}
@@ -63,11 +63,4 @@ test: common-test $(ERRCHECK_BINARY)
 	$(ERRCHECK_BINARY) -verbose -exclude scripts/errcheck_excludes.txt -ignoretests ./...
 
 $(ERRCHECK_BINARY):
-# Get errcheck from a temporary directory to avoid modifying the local go.{mod,sum}.
-# See https://github.com/golang/go/issues/27643.
-	tmpModule=$$(mktemp -d 2>&1) && \
-	mkdir -p $${tmpModule}/staticcheck && \
-	cd "$${tmpModule}"/staticcheck && \
-	GO111MODULE=on $(GO) mod init example.com/staticcheck && \
-	GO111MODULE=on GOOS= GOARCH= $(GO) get -u github.com/kisielk/errcheck && \
-	rm -rf $${tmpModule};
+	(cd .. && GO111MODULE=on GOOS= GOARCH= $(GO) get github.com/kisielk/errcheck@v1.2.0)

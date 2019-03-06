@@ -226,6 +226,13 @@ func NewEmail(c *config.EmailConfig, t *template.Template, l log.Logger) *Email 
 // auth resolves a string of authentication mechanisms.
 func (n *Email) auth(mechs string) (smtp.Auth, error) {
 	username := n.conf.AuthUsername
+
+	// If no username is set, keep going without authentication.
+	if n.conf.AuthUsername == "" {
+		level.Debug(n.logger).Log("msg", "smtp_auth_username is not configured. Attempting to send email without authenticating")
+		return nil, nil
+	}
+
 	err := &types.MultiError{}
 	for _, mech := range strings.Split(mechs, " ") {
 		switch mech {
@@ -582,6 +589,12 @@ func (n *PagerDuty) notifyV2(
 		n.conf.Severity = "error"
 	}
 
+	summary := tmpl(n.conf.Description)
+	summaryRunes := []rune(summary)
+	if len(summaryRunes) > 1024 {
+		summary = string(summaryRunes[:1018]) + " [...]"
+	}
+
 	msg := &pagerDutyMessage{
 		Client:      tmpl(n.conf.Client),
 		ClientURL:   tmpl(n.conf.ClientURL),
@@ -591,7 +604,7 @@ func (n *PagerDuty) notifyV2(
 		Images:      make([]pagerDutyImage, len(n.conf.Images)),
 		Links:       make([]pagerDutyLink, len(n.conf.Links)),
 		Payload: &pagerDutyPayload{
-			Summary:       tmpl(n.conf.Description),
+			Summary:       summary,
 			Source:        tmpl(n.conf.Client),
 			Severity:      tmpl(n.conf.Severity),
 			CustomDetails: details,
@@ -618,14 +631,23 @@ func (n *PagerDuty) notifyV2(
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to encode PagerDuty v2 message: %v", err)
 	}
 
 	resp, err := post(ctx, c, n.conf.URL.String(), contentTypeJSON, &buf)
 	if err != nil {
-		return true, err
+		return true, fmt.Errorf("failed to post message to PagerDuty: %v", err)
 	}
 	defer resp.Body.Close()
+
+	// See: https://v2.developer.pagerduty.com/docs/events-api-v2#api-response-codes--retry-logic
+	if resp.StatusCode == http.StatusBadRequest {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return false, fmt.Errorf("failed to read error response from PagerDuty (status: %d): %v", resp.StatusCode, err)
+		}
+		level.Debug(n.logger).Log("msg", "Received error response from PagerDuty", "incident", key, "code", resp.StatusCode, "body", string(body))
+	}
 
 	return n.retryV2(resp.StatusCode)
 }
@@ -1211,10 +1233,9 @@ func (n *OpsGenie) createRequest(ctx context.Context, as ...*types.Alert) (*http
 		apiURL.RawQuery = q.Encode()
 		msg = &opsGenieCloseMessage{Source: tmpl(n.conf.Source)}
 	default:
-		message := tmpl(n.conf.Message)
-		if len(message) > 130 {
-			message = message[:127] + "..."
-			level.Debug(n.logger).Log("msg", "Truncated message to %q due to OpsGenie message limit", "truncated_message", message, "incident", key)
+		message, truncated := truncate(tmpl(n.conf.Message), 130)
+		if truncated {
+			level.Debug(n.logger).Log("msg", "truncated message due to OpsGenie message limit", "truncated_message", message, "incident", key)
 		}
 
 		apiURL.Path += "v2/alerts"
@@ -1352,9 +1373,9 @@ func (n *VictorOps) createVictorOpsPayload(ctx context.Context, as ...*types.Ale
 		messageType = victorOpsEventResolve
 	}
 
-	if len(stateMessage) > 20480 {
-		stateMessage = stateMessage[0:20475] + "\n..."
-		level.Debug(n.logger).Log("msg", "Truncated stateMessage due to VictorOps stateMessage limit", "truncated_state_message", stateMessage, "incident", key)
+	stateMessage, truncated := truncate(stateMessage, 20480)
+	if truncated {
+		level.Debug(n.logger).Log("msg", "truncated stateMessage due to VictorOps stateMessage limit", "truncated_state_message", stateMessage, "incident", key)
 	}
 
 	msg := map[string]string{
@@ -1429,9 +1450,8 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	parameters.Add("token", tmpl(string(n.conf.Token)))
 	parameters.Add("user", tmpl(string(n.conf.UserKey)))
 
-	title := tmpl(n.conf.Title)
-	if len(title) > 250 {
-		title = title[:247] + "..."
+	title, truncated := truncate(tmpl(n.conf.Title), 250)
+	if truncated {
 		level.Debug(n.logger).Log("msg", "Truncated title due to Pushover title limit", "truncated_title", title, "incident", key)
 	}
 	parameters.Add("title", title)
@@ -1443,8 +1463,8 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		message = tmpl(n.conf.Message)
 	}
 
-	if len(message) > 1024 {
-		message = message[:1021] + "..."
+	message, truncated = truncate(message, 1024)
+	if truncated {
 		level.Debug(n.logger).Log("msg", "Truncated message due to Pushover message limit", "truncated_message", message, "incident", key)
 	}
 	message = strings.TrimSpace(message)
@@ -1454,9 +1474,8 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	}
 	parameters.Add("message", message)
 
-	supplementaryURL := tmpl(n.conf.URL)
-	if len(supplementaryURL) > 512 {
-		supplementaryURL = supplementaryURL[:509] + "..."
+	supplementaryURL, truncated := truncate(tmpl(n.conf.URL), 512)
+	if truncated {
 		level.Debug(n.logger).Log("msg", "Truncated URL due to Pushover url limit", "truncated_url", supplementaryURL, "incident", key)
 	}
 	parameters.Add("url", supplementaryURL)
@@ -1659,4 +1678,15 @@ func (d *Dingtalk) retry(statusCode int) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func truncate(s string, n int) (string, bool) {
+	r := []rune(s)
+	if len(r) <= n {
+		return s, false
+	}
+	if n <= 3 {
+		return string(r[:n]), true
+	}
+	return string(r[:n-3]) + "...", true
 }
