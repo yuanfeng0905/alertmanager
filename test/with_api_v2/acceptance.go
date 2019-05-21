@@ -29,10 +29,10 @@ import (
 	"testing"
 	"time"
 
-	apiclient "github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/client"
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/client/alert"
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/client/general"
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/models"
+	apiclient "github.com/prometheus/alertmanager/api/v2/client"
+	"github.com/prometheus/alertmanager/api/v2/client/alert"
+	"github.com/prometheus/alertmanager/api/v2/client/general"
+	"github.com/prometheus/alertmanager/api/v2/models"
 
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
@@ -51,7 +51,7 @@ type AcceptanceTest struct {
 	actions map[float64][]func()
 }
 
-// AcceptanceOpts defines configuration paramters for an acceptance test.
+// AcceptanceOpts defines configuration parameters for an acceptance test.
 type AcceptanceOpts struct {
 	RoutePrefix string
 	Tolerance   time.Duration
@@ -357,11 +357,12 @@ func (am *Alertmanager) Start(additionalArg []string) error {
 func (am *Alertmanager) WaitForCluster(size int) error {
 	params := general.NewGetStatusParams()
 	params.WithContext(context.Background())
-	var status general.GetStatusOK
+	var status *general.GetStatusOK
 
 	// Poll for 2s
 	for i := 0; i < 20; i++ {
-		status, err := am.clientV2.General.GetStatus(params)
+		var err error
+		status, err = am.clientV2.General.GetStatus(params)
 		if err != nil {
 			return err
 		}

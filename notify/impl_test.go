@@ -14,30 +14,89 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/go-kit/kit/log"
+	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/types"
-	"github.com/prometheus/common/model"
 )
+
+// getContextWithCancelingURL returns a context that gets canceled when a
+// client does a GET request to the returned URL.
+// Handlers passed to the function will be invoked in order before the context gets canceled.
+func getContextWithCancelingURL(h ...func(w http.ResponseWriter, r *http.Request)) (context.Context, *url.URL, func()) {
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	i := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if i < len(h) {
+			h[i](w, r)
+		} else {
+			cancel()
+			<-done
+		}
+		i++
+	}))
+
+	// No need to check the error since httptest.NewServer always return a valid URL.
+	u, _ := url.Parse(srv.URL)
+
+	return ctx, u, func() {
+		close(done)
+		srv.Close()
+	}
+}
+
+// assertNotifyLeaksNoSecret calls the Notify() method of the notifier, expects
+// it to fail because the context is canceled by the server and checks that no
+// secret data is leaked in the error message returned by Notify().
+func assertNotifyLeaksNoSecret(t *testing.T, ctx context.Context, n Notifier, secret ...string) {
+	t.Helper()
+	require.NotEmpty(t, secret)
+
+	ctx = WithGroupKey(ctx, "1")
+	ok, err := n.Notify(ctx, []*types.Alert{
+		&types.Alert{
+			Alert: model.Alert{
+				Labels: model.LabelSet{
+					"lbl1": "val1",
+				},
+				StartsAt: time.Now(),
+				EndsAt:   time.Now().Add(time.Hour),
+			},
+		},
+	}...)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), context.Canceled.Error())
+	for _, s := range secret {
+		require.NotContains(t, err.Error(), s)
+	}
+	require.True(t, ok)
+}
 
 func TestWebhookRetry(t *testing.T) {
 	u, err := url.Parse("http://example.com")
 	if err != nil {
 		t.Fatalf("failed to parse URL: %v", err)
 	}
-	notifier := &Webhook{conf: &config.WebhookConfig{URL: &config.URL{u}}}
+	notifier := &Webhook{conf: &config.WebhookConfig{URL: &config.URL{URL: u}}}
 	for statusCode, expected := range retryTests(defaultRetryCodes()) {
 		actual, _ := notifier.retry(statusCode)
 		require.Equal(t, expected, actual, fmt.Sprintf("error on status %d", statusCode))
@@ -62,8 +121,89 @@ func TestPagerDutyRetryV2(t *testing.T) {
 
 	retryCodes := append(defaultRetryCodes(), http.StatusTooManyRequests)
 	for statusCode, expected := range retryTests(retryCodes) {
-		actual, _ := notifier.retryV2(statusCode)
+		resp := &http.Response{
+			StatusCode: statusCode,
+		}
+		actual, _ := notifier.retryV2(resp)
 		require.Equal(t, expected, actual, fmt.Sprintf("retryv2 - error on status %d", statusCode))
+	}
+}
+
+func TestPagerDutyRedactedURLV1(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	key := "01234567890123456789012345678901"
+	notifier := NewPagerDuty(
+		&config.PagerdutyConfig{
+			ServiceKey: config.Secret(key),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+	notifier.apiV1 = u.String()
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, key)
+}
+
+func TestPagerDutyRedactedURLV2(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	key := "01234567890123456789012345678901"
+	notifier := NewPagerDuty(
+		&config.PagerdutyConfig{
+			URL:        &config.URL{URL: u},
+			RoutingKey: config.Secret(key),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, key)
+}
+
+func TestPagerDutyErr(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   io.Reader
+
+		exp string
+	}{
+		{
+			status: http.StatusBadRequest,
+			body: bytes.NewBuffer([]byte(
+				`{"status":"invalid event","message":"Event object is invalid","errors":["Length of 'routing_key' is incorrect (should be 32 characters)"]}`,
+			)),
+
+			exp: "Length of 'routing_key' is incorrect",
+		},
+		{
+			status: http.StatusBadRequest,
+			body:   bytes.NewBuffer([]byte(`{"status"}`)),
+
+			exp: "unexpected status code: 400",
+		},
+		{
+			status: http.StatusBadRequest,
+			body:   nil,
+
+			exp: "unexpected status code: 400",
+		},
+		{
+			status: http.StatusTooManyRequests,
+			body:   bytes.NewBuffer([]byte("")),
+
+			exp: "unexpected status code: 429",
+		},
+	} {
+		tc := tc
+		t.Run("", func(t *testing.T) {
+			err := pagerDutyErr(tc.status, tc.body)
+			require.Contains(t, err.Error(), tc.exp)
+		})
 	}
 }
 
@@ -75,6 +215,22 @@ func TestSlackRetry(t *testing.T) {
 	}
 }
 
+func TestSlackRedactedURL(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	notifier := NewSlack(
+		&config.SlackConfig{
+			APIURL:     &config.SecretURL{URL: u},
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, u.String())
+}
+
 func TestHipchatRetry(t *testing.T) {
 	notifier := new(Hipchat)
 	retryCodes := append(defaultRetryCodes(), http.StatusTooManyRequests)
@@ -82,6 +238,24 @@ func TestHipchatRetry(t *testing.T) {
 		actual, _ := notifier.retry(statusCode)
 		require.Equal(t, expected, actual, fmt.Sprintf("error on status %d", statusCode))
 	}
+}
+
+func TestHipchatRedactedURL(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	token := "secret_token"
+	notifier := NewHipchat(
+		&config.HipchatConfig{
+			APIURL:     &config.URL{URL: u},
+			AuthToken:  config.Secret(token),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, token)
 }
 
 func TestOpsGenieRetry(t *testing.T) {
@@ -94,6 +268,24 @@ func TestOpsGenieRetry(t *testing.T) {
 	}
 }
 
+func TestOpsGenieRedactedURL(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	key := "key"
+	notifier := NewOpsGenie(
+		&config.OpsGenieConfig{
+			APIURL:     &config.URL{URL: u},
+			APIKey:     config.Secret(key),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, key)
+}
+
 func TestVictorOpsRetry(t *testing.T) {
 	notifier := new(VictorOps)
 	for statusCode, expected := range retryTests(defaultRetryCodes()) {
@@ -102,12 +294,49 @@ func TestVictorOpsRetry(t *testing.T) {
 	}
 }
 
+func TestVictorOpsRedactedURL(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	secret := "secret"
+	notifier := NewVictorOps(
+		&config.VictorOpsConfig{
+			APIURL:     &config.URL{URL: u},
+			APIKey:     config.Secret(secret),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, secret)
+}
+
 func TestPushoverRetry(t *testing.T) {
 	notifier := new(Pushover)
 	for statusCode, expected := range retryTests(defaultRetryCodes()) {
 		actual, _ := notifier.retry(statusCode)
 		require.Equal(t, expected, actual, fmt.Sprintf("error on status %d", statusCode))
 	}
+}
+
+func TestPushoverRedactedURL(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	key, token := "user_key", "token"
+	notifier := NewPushover(
+		&config.PushoverConfig{
+			UserKey:    config.Secret(key),
+			Token:      config.Secret(token),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+	notifier.apiURL = u.String()
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, key, token)
 }
 
 func retryTests(retryCodes []int) map[int]bool {
@@ -232,12 +461,21 @@ func TestOpsGenie(t *testing.T) {
 		Message:     `{{ .CommonLabels.Message }}`,
 		Description: `{{ .CommonLabels.Description }}`,
 		Source:      `{{ .CommonLabels.Source }}`,
-		Teams:       `{{ .CommonLabels.Teams }}`,
-		Tags:        `{{ .CommonLabels.Tags }}`,
-		Note:        `{{ .CommonLabels.Note }}`,
-		Priority:    `{{ .CommonLabels.Priority }}`,
-		APIKey:      `{{ .ExternalURL }}`,
-		APIURL:      &config.URL{u},
+		Responders: []config.OpsGenieConfigResponder{
+			{
+				Name: `{{ .CommonLabels.ResponderName1 }}`,
+				Type: `{{ .CommonLabels.ResponderType1 }}`,
+			},
+			{
+				Name: `{{ .CommonLabels.ResponderName2 }}`,
+				Type: `{{ .CommonLabels.ResponderType2 }}`,
+			},
+		},
+		Tags:     `{{ .CommonLabels.Tags }}`,
+		Note:     `{{ .CommonLabels.Note }}`,
+		Priority: `{{ .CommonLabels.Priority }}`,
+		APIKey:   `{{ .ExternalURL }}`,
+		APIURL:   &config.URL{URL: u},
 	}
 	notifier := NewOpsGenie(conf, tmpl, logger)
 
@@ -266,19 +504,22 @@ func TestOpsGenie(t *testing.T) {
 	alert2 := &types.Alert{
 		Alert: model.Alert{
 			Labels: model.LabelSet{
-				"Message":     "message",
-				"Description": "description",
-				"Source":      "http://prometheus",
-				"Teams":       "TeamA,TeamB,",
-				"Tags":        "tag1,tag2",
-				"Note":        "this is a note",
-				"Priotity":    "P1",
+				"Message":        "message",
+				"Description":    "description",
+				"Source":         "http://prometheus",
+				"ResponderName1": "TeamA",
+				"ResponderType1": "team",
+				"ResponderName2": "EscalationA",
+				"ResponderType2": "escalation",
+				"Tags":           "tag1,tag2",
+				"Note":           "this is a note",
+				"Priority":       "P1",
 			},
 			StartsAt: time.Now(),
 			EndsAt:   time.Now().Add(time.Hour),
 		},
 	}
-	expectedBody = `{"alias":"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b","message":"message","description":"description","details":{},"source":"http://prometheus","teams":[{"name":"TeamA"},{"name":"TeamB"}],"tags":["tag1","tag2"],"note":"this is a note"}
+	expectedBody = `{"alias":"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b","message":"message","description":"description","details":{},"source":"http://prometheus","responders":[{"name":"TeamA","type":"team"},{"name":"EscalationA","type":"escalation"}],"tags":["tag1","tag2"],"note":"this is a note","priority":"P1"}
 `
 	req, retry, err = notifier.createRequest(ctx, alert2)
 	require.NoError(t, err)
@@ -292,48 +533,6 @@ func TestOpsGenie(t *testing.T) {
 	require.Equal(t, err.Error(), "templating error: template: :1: function \"kaput\" not defined")
 }
 
-func TestEmailConfigNoAuthMechs(t *testing.T) {
-
-	email := &Email{
-		conf: &config.EmailConfig{AuthUsername: "test"}, tmpl: &template.Template{}, logger: log.NewNopLogger(),
-	}
-	_, err := email.auth("")
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "unknown auth mechanism: ")
-}
-
-func TestEmailConfigMissingAuthParam(t *testing.T) {
-
-	conf := &config.EmailConfig{AuthUsername: "test"}
-	email := &Email{
-		conf: conf, tmpl: &template.Template{}, logger: log.NewNopLogger(),
-	}
-	_, err := email.auth("CRAM-MD5")
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "missing secret for CRAM-MD5 auth mechanism")
-
-	_, err = email.auth("PLAIN")
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "missing password for PLAIN auth mechanism")
-
-	_, err = email.auth("LOGIN")
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "missing password for LOGIN auth mechanism")
-
-	_, err = email.auth("PLAIN LOGIN")
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "missing password for PLAIN auth mechanism; missing password for LOGIN auth mechanism")
-}
-
-func TestEmailNoUsernameStillOk(t *testing.T) {
-	email := &Email{
-		conf: &config.EmailConfig{}, tmpl: &template.Template{}, logger: log.NewNopLogger(),
-	}
-	a, err := email.auth("CRAM-MD5")
-	require.NoError(t, err)
-	require.Nil(t, a)
-}
-
 func TestVictorOpsCustomFields(t *testing.T) {
 	logger := log.NewNopLogger()
 	tmpl := createTmpl(t)
@@ -344,7 +543,7 @@ func TestVictorOpsCustomFields(t *testing.T) {
 
 	conf := &config.VictorOpsConfig{
 		APIKey:            `12345`,
-		APIURL:            &config.URL{url},
+		APIURL:            &config.URL{URL: url},
 		EntityDisplayName: `{{ .CommonLabels.Message }}`,
 		StateMessage:      `{{ .CommonLabels.Message }}`,
 		RoutingKey:        `test`,
@@ -383,6 +582,46 @@ func TestVictorOpsCustomFields(t *testing.T) {
 }
 <<<<<<< HEAD
 =======
+
+func TestWechatRedactedURLOnInitialAuthentication(t *testing.T) {
+	ctx, u, fn := getContextWithCancelingURL()
+	defer fn()
+
+	secret := "secret_key"
+	notifier := NewWechat(
+		&config.WechatConfig{
+			APIURL:     &config.URL{URL: u},
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+			CorpID:     "corpid",
+			APISecret:  config.Secret(secret),
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, secret)
+}
+
+func TestWechatRedactedURLOnNotify(t *testing.T) {
+	secret, token := "secret", "token"
+	ctx, u, fn := getContextWithCancelingURL(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"access_token":"%s"}`, token)
+	})
+	defer fn()
+
+	notifier := NewWechat(
+		&config.WechatConfig{
+			APIURL:     &config.URL{URL: u},
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+			CorpID:     "corpid",
+			APISecret:  config.Secret(secret),
+		},
+		createTmpl(t),
+		log.NewNopLogger(),
+	)
+
+	assertNotifyLeaksNoSecret(t, ctx, notifier, secret, token)
+}
 
 func TestTruncate(t *testing.T) {
 	testCases := []struct {

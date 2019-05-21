@@ -20,7 +20,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/oklog/oklog/pkg/group"
+	"github.com/oklog/run"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/alertmanager/config"
@@ -84,7 +84,7 @@ func (ih *Inhibitor) run(ctx context.Context) {
 // Run the Inhibitor's background processing.
 func (ih *Inhibitor) Run() {
 	var (
-		g   group.Group
+		g   run.Group
 		ctx context.Context
 	)
 
@@ -204,7 +204,7 @@ func NewInhibitRule(cr *config.InhibitRule) *InhibitRule {
 // source and the target side of the rule are disregarded.
 func (r *InhibitRule) hasEqual(lset model.LabelSet, excludeTwoSidedMatch bool) (model.Fingerprint, bool) {
 Outer:
-	for a := range r.scache.List() {
+	for _, a := range r.scache.List() {
 		// The cache might be stale and contain resolved alerts.
 		if a.Resolved() {
 			continue

@@ -19,10 +19,10 @@ import (
 	"time"
 
 	"github.com/go-openapi/strfmt"
+	"github.com/prometheus/alertmanager/api/v2/client/alert"
+	"github.com/prometheus/alertmanager/api/v2/client/silence"
+	"github.com/prometheus/alertmanager/api/v2/models"
 	a "github.com/prometheus/alertmanager/test/with_api_v2"
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/client/alert"
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/client/silence"
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/models"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 )
@@ -163,5 +163,71 @@ receivers:
 		} else {
 			require.Equal(t, models.AlertStatusStateSuppressed, *alert.Status.State)
 		}
+	}
+}
+
+func TestFilterAlertRequest(t *testing.T) {
+	t.Parallel()
+
+	conf := `
+route:
+  receiver: "default"
+  group_by: []
+  group_wait:      1s
+  group_interval:  10m
+  repeat_interval: 1h
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']
+
+receivers:
+- name: "default"
+  webhook_configs:
+  - url: 'http://%s'
+`
+
+	at := a.NewAcceptanceTest(t, &a.AcceptanceOpts{
+		Tolerance: 1 * time.Second,
+	})
+	co := at.Collector("webhook")
+	wh := a.NewWebhook(co)
+
+	amc := at.AlertmanagerCluster(fmt.Sprintf(conf, wh.Address()), 1)
+	require.NoError(t, amc.Start())
+	defer amc.Terminate()
+
+	am := amc.Members()[0]
+
+	now := time.Now()
+	startsAt := strfmt.DateTime(now)
+	endsAt := strfmt.DateTime(now.Add(5 * time.Minute))
+
+	labels := models.LabelSet(map[string]string{"alertname": "test1", "severity": "warning"})
+	pa1 := &models.PostableAlert{
+		StartsAt: startsAt,
+		EndsAt:   endsAt,
+		Alert:    models.Alert{Labels: labels},
+	}
+	labels = models.LabelSet(map[string]string{"system": "foo", "severity": "critical"})
+	pa2 := &models.PostableAlert{
+		StartsAt: startsAt,
+		EndsAt:   endsAt,
+		Alert:    models.Alert{Labels: labels},
+	}
+	alertParams := alert.NewPostAlertsParams()
+	alertParams.Alerts = models.PostableAlerts{pa1, pa2}
+	_, err := am.Client().Alert.PostAlerts(alertParams)
+	require.NoError(t, err)
+
+	filter := []string{"alertname=test1", "severity=warning"}
+	resp, err := am.Client().Alert.GetAlerts(alert.NewGetAlertsParams().WithFilter(filter))
+	require.NoError(t, err)
+	require.Equal(t, 1, len(resp.Payload))
+	for _, alert := range resp.Payload {
+		require.Equal(t, models.AlertStatusStateActive, *alert.Status.State)
 	}
 }
