@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	commoncfg "github.com/prometheus/common/config"
 
 	"github.com/prometheus/alertmanager/config"
@@ -16,102 +17,90 @@ import (
 	"github.com/prometheus/alertmanager/types"
 )
 
-
-// ----------------------------------------------------------------------
-// add Dingtalk notify plugin
-// ----------------------------------------------------------------------
-type Dingtalk struct {
+// Notifier add Dingtalk notify plugin
+type Notifier struct {
 	conf   *config.DingtalkConfig
 	tmpl   *template.Template
 	logger log.Logger
+	client *http.Client
 }
 
-type TextContent struct {
+type textContent struct {
 	Content string `json:"content"`
 }
 
-type AtContent struct {
+type atContent struct {
 	AtMobiles []string `json:"atMobiles"`
 	IsAtAll   bool     `json:"isAtAll"`
 }
 
-type DingtalkMessage struct {
+type dingtalkMessage struct {
 	Msgtype string      `json:"msgtype"`
-	Text    TextContent `json:"text"`
-	At      *AtContent  `json:"at"`
+	Text    textContent `json:"text"`
+	At      *atContent  `json:"at"`
 }
 
-func NewDingtalk(conf *config.DingtalkConfig, tmpl *template.Template, l log.Logger) *Dingtalk {
-	return &Dingtalk{conf: conf, tmpl: tmpl, logger: l}
+// New returns a new Dingtalk notification handler.
+func New(c *config.DingtalkConfig, t *template.Template, l log.Logger) (*Notifier, error) {
+	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "dingtalk")
+	if err != nil {
+		return nil, err
+	}
+
+	return &Notifier{
+		conf:   c,
+		tmpl:   t,
+		logger: l,
+		client: client,
+	}, nil
 }
 
 // Notify implements the Notifier interface.
-func (d *Dingtalk) Notify(ctx context.Context, alerts ...*types.Alert) (bool, error) {
-	var tmplErr error
-	data := d.tmpl.Data(receiverName(ctx, d.logger), groupLabels(ctx, d.logger), alerts...)
-	tmpl := tmplText(d.tmpl, data, &tmplErr)
+func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
+	var err error
 
-	token := d.conf.Token
+	data := notify.GetTemplateData(ctx, n.tmpl, as, n.logger)
+	tmpl := notify.TmplText(n.tmpl, data, &err)
+	token := n.conf.Token
+
 	if token == "" {
-		token, _ = d.conf.GroupToken[d.conf.Group]
+		token, _ = n.conf.GroupToken[n.conf.Group]
 	}
 	if token == "" {
-		level.Error(d.logger).Log("msg", "invalid group")
-		return false, fmt.Errorf("invalid group=%s", d.conf.Group)
+		level.Error(n.logger).Log("msg", "invalid group")
+		return false, fmt.Errorf("invalid group=%s", n.conf.Group)
 	}
 
-	msg := DingtalkMessage{
+	msg := dingtalkMessage{
 		Msgtype: "text",
-		Text:    TextContent{Content: tmpl(d.conf.Content)},
-		At:      &AtContent{IsAtAll: true},
+		Text:    textContent{Content: tmpl(n.conf.Content)},
+		At:      &atContent{IsAtAll: true},
 	}
-	if tmplErr != nil {
-		return false, fmt.Errorf("failed to template: %v", tmplErr)
+	if err != nil {
+		return false, fmt.Errorf("failed to template: %v", err)
 	}
 
-	var msgBuf bytes.Buffer
-	if err := json.NewEncoder(&msgBuf).Encode(msg); err != nil {
-		return false, err
-	}
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s?access_token=%s",
-		config.DefaultGlobalConfig().DingtalkAPIURL.String(), token), &msgBuf)
-	if err != nil {
-		return true, err
-	}
-	req.Header.Set("Content-Type", contentTypeJSON)
-	req.Header.Set("User-Agent", userAgentHeader)
-
-	c, err := commoncfg.NewClientFromConfig(*d.conf.HTTPConfig, "dingtalk")
-	if err != nil {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
 		return false, err
 	}
 
-	resp, err := c.Do(req.WithContext(ctx))
+	url := fmt.Sprintf("%s?access_token=%s", config.DefaultGlobalConfig().DingtalkAPIURL.String(), token)
+	resp, err := notify.PostJSON(ctx, n.client, url, &buf)
 	if err != nil {
-		return true, err
+		return true, notify.RedactURL(err)
 	}
-	resp.Body.Close()
+	defer notify.Drain(resp)
 
-	return d.retry(resp.StatusCode)
+	return n.retry(resp.StatusCode)
 }
 
-func (d *Dingtalk) retry(statusCode int) (bool, error) {
+func (n *Notifier) retry(statusCode int) (bool, error) {
 	// Webhooks are assumed to respond with 2xx response codes on a successful
 	// request and 5xx response codes are assumed to be recoverable.
 	if statusCode/100 != 2 {
-		return (statusCode/100 == 5), fmt.Errorf("unexpected status code %v from %s", statusCode, d.conf.APIURL)
+		return (statusCode/100 == 5), fmt.Errorf("unexpected status code %v from %s", statusCode, n.conf.APIURL)
 	}
 
 	return false, nil
-}
-
-func truncate(s string, n int) (string, bool) {
-	r := []rune(s)
-	if len(r) <= n {
-		return s, false
-	}
-	if n <= 3 {
-		return string(r[:n]), true
-	}
-	return string(r[:n-3]) + "...", true
 }
