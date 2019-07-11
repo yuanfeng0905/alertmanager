@@ -22,11 +22,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/alertmanager/notify"
-
-	"github.com/prometheus/alertmanager/test/with_api_v2/api_v2_client/models"
-
 	"github.com/go-openapi/strfmt"
+
+	"github.com/prometheus/alertmanager/api/v2/models"
+	"github.com/prometheus/alertmanager/notify/webhook"
 )
 
 // At is a convenience method to allow for declarative syntax of Acceptance
@@ -106,13 +105,15 @@ func (s *TestSilence) ID() string {
 func (s *TestSilence) nativeSilence(opts *AcceptanceOpts) *models.Silence {
 	nsil := &models.Silence{}
 
+	t := false
 	for i := 0; i < len(s.match); i += 2 {
 		nsil.Matchers = append(nsil.Matchers, &models.Matcher{
-			Name:  &s.match[i],
-			Value: &s.match[i+1],
+			Name:    &s.match[i],
+			Value:   &s.match[i+1],
+			IsRegex: &t,
 		})
 	}
-	t := true
+	t = true
 	for i := 0; i < len(s.matchRE); i += 2 {
 		nsil.Matchers = append(nsil.Matchers, &models.Matcher{
 			Name:    &s.matchRE[i],
@@ -167,19 +168,25 @@ func Alert(keyval ...interface{}) *TestAlert {
 
 // nativeAlert converts the declared test alert into a full alert based
 // on the given parameters.
-func (a *TestAlert) nativeAlert(opts *AcceptanceOpts) *models.Alert {
-	na := &models.Alert{
-		Labels:      a.labels,
+func (a *TestAlert) nativeAlert(opts *AcceptanceOpts) *models.GettableAlert {
+	na := &models.GettableAlert{
+		Alert: models.Alert{
+			Labels: a.labels,
+		},
 		Annotations: a.annotations,
+		StartsAt:    &strfmt.DateTime{},
+		EndsAt:      &strfmt.DateTime{},
 	}
 
 	if a.startsAt > 0 {
 		start := strfmt.DateTime(opts.expandTime(a.startsAt))
-		na.StartsAt = start
+		na.StartsAt = &start
 	}
 	if a.endsAt > 0 {
-		na.EndsAt = strfmt.DateTime(opts.expandTime(a.endsAt))
+		end := strfmt.DateTime(opts.expandTime(a.endsAt))
+		na.EndsAt = &end
 	}
+
 	return na
 }
 
@@ -215,7 +222,7 @@ func (a *TestAlert) Active(tss ...float64) *TestAlert {
 	return a
 }
 
-func equalAlerts(a, b *models.Alert, opts *AcceptanceOpts) bool {
+func equalAlerts(a, b *models.GettableAlert, opts *AcceptanceOpts) bool {
 	if !reflect.DeepEqual(a.Labels, b.Labels) {
 		return false
 	}
@@ -223,10 +230,13 @@ func equalAlerts(a, b *models.Alert, opts *AcceptanceOpts) bool {
 		return false
 	}
 
-	if !equalTime(time.Time(a.StartsAt), time.Time(b.StartsAt), opts) {
+	if !equalTime(time.Time(*a.StartsAt), time.Time(*b.StartsAt), opts) {
 		return false
 	}
-	if !equalTime(time.Time(a.EndsAt), time.Time(b.EndsAt), opts) {
+	if (a.EndsAt == nil) != (b.EndsAt == nil) {
+		return false
+	}
+	if !(a.EndsAt == nil) && !(b.EndsAt == nil) && !equalTime(time.Time(*a.EndsAt), time.Time(*b.EndsAt), opts) {
 		return false
 	}
 	return true
@@ -288,13 +298,13 @@ func (ws *MockWebhook) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	dec := json.NewDecoder(req.Body)
 	defer req.Body.Close()
 
-	var v notify.WebhookMessage
+	var v webhook.Message
 	if err := dec.Decode(&v); err != nil {
 		panic(err)
 	}
 
 	// Transform the webhook message alerts back into model.Alerts.
-	var alerts models.Alerts
+	var alerts models.GettableAlerts
 	for _, a := range v.Alerts {
 		var (
 			labels      = models.LabelSet{}
@@ -308,13 +318,16 @@ func (ws *MockWebhook) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		start := strfmt.DateTime(a.StartsAt)
+		end := strfmt.DateTime(a.EndsAt)
 
-		alerts = append(alerts, &models.Alert{
-			Labels:       labels,
-			Annotations:  annotations,
-			StartsAt:     start,
-			EndsAt:       strfmt.DateTime(a.EndsAt),
-			GeneratorURL: strfmt.URI(a.GeneratorURL),
+		alerts = append(alerts, &models.GettableAlert{
+			Alert: models.Alert{
+				Labels:       labels,
+				GeneratorURL: strfmt.URI(a.GeneratorURL),
+			},
+			Annotations: annotations,
+			StartsAt:    &start,
+			EndsAt:      &end,
 		})
 	}
 

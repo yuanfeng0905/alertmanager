@@ -29,13 +29,25 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+const secretToken = "<secret>"
+
+var secretTokenJSON string
+
+func init() {
+	b, err := json.Marshal(secretToken)
+	if err != nil {
+		panic(err)
+	}
+	secretTokenJSON = string(b)
+}
+
 // Secret is a string that must not be revealed on marshaling.
 type Secret string
 
-// MarshalYAML implements the yaml.Marshaler interface.
+// MarshalYAML implements the yaml.Marshaler interface for Secret.
 func (s Secret) MarshalYAML() (interface{}, error) {
 	if s != "" {
-		return "<secret>", nil
+		return secretToken, nil
 	}
 	return nil, nil
 }
@@ -46,9 +58,9 @@ func (s *Secret) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return unmarshal((*plain)(s))
 }
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the json.Marshaler interface for Secret.
 func (s Secret) MarshalJSON() ([]byte, error) {
-	return json.Marshal("<secret>")
+	return json.Marshal(secretToken)
 }
 
 // URL is a custom type that represents an HTTP or HTTPS URL and allows validation at configuration load time.
@@ -112,23 +124,41 @@ type SecretURL URL
 // MarshalYAML implements the yaml.Marshaler interface for SecretURL.
 func (s SecretURL) MarshalYAML() (interface{}, error) {
 	if s.URL != nil {
-		return "<secret>", nil
+		return secretToken, nil
 	}
 	return nil, nil
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface for SecretURL.
 func (s *SecretURL) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var str string
+	if err := unmarshal(&str); err != nil {
+		return err
+	}
+	// In order to deserialize a previously serialized configuration (eg from
+	// the Alertmanager API with amtool), `<secret>` needs to be treated
+	// specially, as it isn't a valid URL.
+	if str == secretToken {
+		s.URL = &url.URL{}
+		return nil
+	}
 	return unmarshal((*URL)(s))
 }
 
 // MarshalJSON implements the json.Marshaler interface for SecretURL.
 func (s SecretURL) MarshalJSON() ([]byte, error) {
-	return json.Marshal("<secret>")
+	return json.Marshal(secretToken)
 }
 
 // UnmarshalJSON implements the json.Marshaler interface for SecretURL.
 func (s *SecretURL) UnmarshalJSON(data []byte) error {
+	// In order to deserialize a previously serialized configuration (eg from
+	// the Alertmanager API with amtool), `<secret>` needs to be treated
+	// specially, as it isn't a valid URL.
+	if string(data) == secretToken || string(data) == secretTokenJSON {
+		s.URL = &url.URL{}
+		return nil
+	}
 	return json.Unmarshal(data, (*URL)(s))
 }
 
@@ -205,7 +235,7 @@ func (c Config) String() string {
 	return string(b)
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Config.
 func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// We want to set c to the defaults and then overwrite it with the input.
 	// To make unmarshal fill the plain data struct rather than calling UnmarshalYAML
@@ -219,7 +249,7 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// We have to restore it here.
 	if c.Global == nil {
 		c.Global = &GlobalConfig{}
-		*c.Global = DefaultGlobalConfig
+		*c.Global = DefaultGlobalConfig()
 	}
 
 	names := map[string]struct{}{}
@@ -426,33 +456,35 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // checkReceiver returns an error if a node in the routing tree
 // references a receiver not in the given map.
 func checkReceiver(r *Route, receivers map[string]struct{}) error {
+	for _, sr := range r.Routes {
+		if err := checkReceiver(sr, receivers); err != nil {
+			return err
+		}
+	}
 	if r.Receiver == "" {
 		return nil
 	}
 	if _, ok := receivers[r.Receiver]; !ok {
 		return fmt.Errorf("undefined receiver %q used in route", r.Receiver)
 	}
-	for _, sr := range r.Routes {
-		if err := checkReceiver(sr, receivers); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-// DefaultGlobalConfig provides global default values.
-var DefaultGlobalConfig = GlobalConfig{
-	ResolveTimeout: model.Duration(5 * time.Minute),
-	HTTPConfig:     &commoncfg.HTTPClientConfig{},
+// DefaultGlobalConfig returns GlobalConfig with default values.
+func DefaultGlobalConfig() GlobalConfig {
+	return GlobalConfig{
+		ResolveTimeout: model.Duration(5 * time.Minute),
+		HTTPConfig:     &commoncfg.HTTPClientConfig{},
 
-	SMTPHello:       "localhost",
-	SMTPRequireTLS:  true,
-	PagerdutyURL:    mustParseURL("https://events.pagerduty.com/v2/enqueue"),
-	HipchatAPIURL:   mustParseURL("https://api.hipchat.com/"),
-	OpsGenieAPIURL:  mustParseURL("https://api.opsgenie.com/"),
-	WeChatAPIURL:    mustParseURL("https://qyapi.weixin.qq.com/cgi-bin/"),
-	VictorOpsAPIURL: mustParseURL("https://alert.victorops.com/integrations/generic/20131114/alert/"),
-	DingtalkAPIURL:  mustParseURL("https://oapi.dingtalk.com/robot/send/"),
+		SMTPHello:       "localhost",
+		SMTPRequireTLS:  true,
+		PagerdutyURL:    mustParseURL("https://events.pagerduty.com/v2/enqueue"),
+		HipchatAPIURL:   mustParseURL("https://api.hipchat.com/"),
+		OpsGenieAPIURL:  mustParseURL("https://api.opsgenie.com/"),
+		WeChatAPIURL:    mustParseURL("https://qyapi.weixin.qq.com/cgi-bin/"),
+		VictorOpsAPIURL: mustParseURL("https://alert.victorops.com/integrations/generic/20131114/alert/"),
+		DingtalkAPIURL:  mustParseURL("https://oapi.dingtalk.com/robot/send/"),
+	}
 }
 
 func mustParseURL(s string) *URL {
@@ -510,17 +542,20 @@ type GlobalConfig struct {
 	DingtalkGroupToken map[string]string `yaml:"dingtalk_group_token,omitempty" json:"dingtalk_group_token,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for GlobalConfig.
 func (c *GlobalConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	*c = DefaultGlobalConfig
+	*c = DefaultGlobalConfig()
 	type plain GlobalConfig
 	return unmarshal((*plain)(c))
 }
 
 // A Route is a node that contains definitions of how to handle alerts.
 type Route struct {
-	Receiver string            `yaml:"receiver,omitempty" json:"receiver,omitempty"`
-	GroupBy  []model.LabelName `yaml:"group_by,omitempty" json:"group_by,omitempty"`
+	Receiver string `yaml:"receiver,omitempty" json:"receiver,omitempty"`
+
+	GroupByStr []string          `yaml:"group_by,omitempty" json:"group_by,omitempty"`
+	GroupBy    []model.LabelName `yaml:"-" json:"-"`
+	GroupByAll bool              `yaml:"-" json:"-"`
 
 	Match    map[string]string `yaml:"match,omitempty" json:"match,omitempty"`
 	MatchRE  map[string]Regexp `yaml:"match_re,omitempty" json:"match_re,omitempty"`
@@ -532,7 +567,7 @@ type Route struct {
 	RepeatInterval *model.Duration `yaml:"repeat_interval,omitempty" json:"repeat_interval,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Route.
 func (r *Route) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type plain Route
 	if err := unmarshal((*plain)(r)); err != nil {
@@ -549,6 +584,21 @@ func (r *Route) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		if !model.LabelNameRE.MatchString(k) {
 			return fmt.Errorf("invalid label name %q", k)
 		}
+	}
+	for _, l := range r.GroupByStr {
+		if l == "..." {
+			r.GroupByAll = true
+		} else {
+			labelName := model.LabelName(l)
+			if !labelName.IsValid() {
+				return fmt.Errorf("invalid label name %q in group_by list", l)
+			}
+			r.GroupBy = append(r.GroupBy, labelName)
+		}
+	}
+
+	if len(r.GroupBy) > 0 && r.GroupByAll {
+		return fmt.Errorf("cannot have wildcard group_by (`...`) and other other labels at the same time")
 	}
 
 	groupBy := map[model.LabelName]struct{}{}
@@ -591,7 +641,7 @@ type InhibitRule struct {
 	Equal model.LabelNames `yaml:"equal,omitempty" json:"equal,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for InhibitRule.
 func (r *InhibitRule) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type plain InhibitRule
 	if err := unmarshal((*plain)(r)); err != nil {
@@ -642,7 +692,7 @@ type Receiver struct {
 	DingtalkConfigs  []*DingtalkConfig  `yaml:"dingtalk_configs,omitempty" json:"dingtalk_configs,omitempty"`
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Receiver.
 func (c *Receiver) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type plain Receiver
 	if err := unmarshal((*plain)(c)); err != nil {
@@ -657,9 +707,10 @@ func (c *Receiver) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // Regexp encapsulates a regexp.Regexp and makes it YAML marshalable.
 type Regexp struct {
 	*regexp.Regexp
+	original string
 }
 
-// UnmarshalYAML implements the yaml.Unmarshaler interface.
+// UnmarshalYAML implements the yaml.Unmarshaler interface for Regexp.
 func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
@@ -670,18 +721,19 @@ func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 	re.Regexp = regex
+	re.original = s
 	return nil
 }
 
-// MarshalYAML implements the yaml.Marshaler interface.
+// MarshalYAML implements the yaml.Marshaler interface for Regexp.
 func (re Regexp) MarshalYAML() (interface{}, error) {
-	if re.Regexp != nil {
-		return re.String(), nil
+	if re.original != "" {
+		return re.original, nil
 	}
 	return nil, nil
 }
 
-// UnmarshalJSON implements the json.Marshaler interface
+// UnmarshalJSON implements the json.Marshaler interface for Regexp
 func (re *Regexp) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -692,13 +744,14 @@ func (re *Regexp) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	re.Regexp = regex
+	re.original = s
 	return nil
 }
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the json.Marshaler interface for Regexp.
 func (re Regexp) MarshalJSON() ([]byte, error) {
-	if re.Regexp != nil {
-		return json.Marshal(re.String())
+	if re.original != "" {
+		return json.Marshal(re.original)
 	}
 	return nil, nil
 }

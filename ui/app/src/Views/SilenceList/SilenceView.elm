@@ -2,7 +2,6 @@ module Views.SilenceList.SilenceView exposing (deleteButton, editButton, view)
 
 import Data.GettableSilence exposing (GettableSilence)
 import Data.Matcher exposing (Matcher)
-import Data.Matchers exposing (Matchers)
 import Data.SilenceStatus exposing (State(..))
 import Dict exposing (Dict)
 import Html exposing (Html, a, b, button, div, h3, i, li, p, small, span, text)
@@ -16,7 +15,7 @@ import Utils.List
 import Utils.Views exposing (buttonLink)
 import Views.FilterBar.Types as FilterBarTypes
 import Views.Shared.Dialog as Dialog
-import Views.SilenceForm.Parsing exposing (newSilenceFromAlertLabels)
+import Views.SilenceForm.Parsing exposing (newSilenceFromMatchers)
 import Views.SilenceList.Types exposing (SilenceListMsg(..))
 
 
@@ -101,9 +100,6 @@ matcherButton matcher =
 editButton : GettableSilence -> Html Msg
 editButton silence =
     let
-        matchers =
-            List.map (\s -> ( s.name, s.value )) silence.matchers
-
         editUrl =
             String.join "/" [ "#/silences", silence.id, "edit" ]
 
@@ -118,7 +114,7 @@ editButton silence =
         Expired ->
             a
                 [ class "btn btn-outline-info border-0"
-                , href (newSilenceFromAlertLabels <| Dict.fromList matchers)
+                , href (newSilenceFromMatchers silence.matchers)
                 ]
                 [ text "Recreate"
                 ]

@@ -1,5 +1,6 @@
 sudo: false
 language: go
+go_import_path: github.com/prometheus/alertmanager
 
 services:
 - docker
@@ -7,7 +8,7 @@ services:
 # Whenever the Go version is updated here, .circleci/config.yml and .promu.yml
 # should also be updated.
 go:
-- 1.11.x
+- 1.12.x
 
 script:
 # test front-end
@@ -17,3 +18,4 @@ script:
 - git diff --exit-code
 # test back-end
 - make
+- git diff --exit-code

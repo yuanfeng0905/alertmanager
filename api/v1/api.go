@@ -31,6 +31,7 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/pkg/labels"
 
+	"github.com/prometheus/alertmanager/api/metrics"
 	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
@@ -41,31 +42,9 @@ import (
 	"github.com/prometheus/alertmanager/types"
 )
 
-var (
-	numReceivedAlerts = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "alertmanager",
-		Name:      "alerts_received_total",
-		Help:      "The total number of received alerts.",
-	}, []string{"status"})
-
-	numInvalidAlerts = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: "alertmanager",
-		Name:      "alerts_invalid_total",
-		Help:      "The total number of received alerts that were invalid.",
-	})
-)
-
-func init() {
-	numReceivedAlerts.WithLabelValues("firing")
-	numReceivedAlerts.WithLabelValues("resolved")
-
-	prometheus.MustRegister(numReceivedAlerts)
-	prometheus.MustRegister(numInvalidAlerts)
-}
-
 var corsHeaders = map[string]string{
 	"Access-Control-Allow-Headers":  "Accept, Authorization, Content-Type, Origin",
-	"Access-Control-Allow-Methods":  "GET, DELETE, OPTIONS",
+	"Access-Control-Allow-Methods":  "GET, POST, DELETE, OPTIONS",
 	"Access-Control-Allow-Origin":   "*",
 	"Access-Control-Expose-Headers": "Date",
 	"Cache-Control":                 "no-cache, no-store, must-revalidate",
@@ -89,14 +68,14 @@ func setCORS(w http.ResponseWriter) {
 
 // API provides registration of handlers for API routes.
 type API struct {
-	alerts         provider.Alerts
-	silences       *silence.Silences
-	config         *config.Config
-	route          *dispatch.Route
-	resolveTimeout time.Duration
-	uptime         time.Time
-	peer           *cluster.Peer
-	logger         log.Logger
+	alerts   provider.Alerts
+	silences *silence.Silences
+	config   *config.Config
+	route    *dispatch.Route
+	uptime   time.Time
+	peer     *cluster.Peer
+	logger   log.Logger
+	m        *metrics.Alerts
 
 	getAlertStatus getAlertStatusFn
 
@@ -112,6 +91,7 @@ func New(
 	sf getAlertStatusFn,
 	peer *cluster.Peer,
 	l log.Logger,
+	r prometheus.Registerer,
 ) *API {
 	if l == nil {
 		l = log.NewNopLogger()
@@ -124,6 +104,7 @@ func New(
 		uptime:         time.Now(),
 		peer:           peer,
 		logger:         l,
+		m:              metrics.NewAlerts("v1", r),
 	}
 }
 
@@ -152,20 +133,17 @@ func (api *API) Register(r *route.Router) {
 }
 
 // Update sets the configuration string to a new value.
-func (api *API) Update(cfg *config.Config, resolveTimeout time.Duration) error {
+func (api *API) Update(cfg *config.Config) {
 	api.mtx.Lock()
 	defer api.mtx.Unlock()
 
-	api.resolveTimeout = resolveTimeout
 	api.config = cfg
 	api.route = dispatch.NewRoute(cfg.Route, nil)
-	return nil
 }
 
 type errorType string
 
 const (
-	errorNone     errorType = ""
 	errorInternal errorType = "server_error"
 	errorBadData  errorType = "bad_data"
 )
@@ -254,6 +232,7 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 		// are no alerts present
 		res      = []*Alert{}
 		matchers = []*labels.Matcher{}
+		ctx      = r.Context()
 
 		showActive, showInhibited     bool
 		showSilenced, showUnprocessed bool
@@ -327,9 +306,11 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	defer alerts.Close()
 
 	api.mtx.RLock()
-	// TODO(fabxc): enforce a sensible timeout.
 	for a := range alerts.Next() {
 		if err = alerts.Err(); err != nil {
+			break
+		}
+		if err = ctx.Err(); err != nil {
 			break
 		}
 
@@ -429,7 +410,7 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 	now := time.Now()
 
 	api.mtx.RLock()
-	resolveTimeout := api.resolveTimeout
+	resolveTimeout := time.Duration(api.config.Global.ResolveTimeout)
 	api.mtx.RUnlock()
 
 	for _, alert := range alerts {
@@ -450,9 +431,9 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 			alert.EndsAt = now.Add(resolveTimeout)
 		}
 		if alert.EndsAt.After(time.Now()) {
-			numReceivedAlerts.WithLabelValues("firing").Inc()
+			api.m.Firing().Inc()
 		} else {
-			numReceivedAlerts.WithLabelValues("resolved").Inc()
+			api.m.Resolved().Inc()
 		}
 	}
 
@@ -466,7 +447,7 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 
 		if err := a.Validate(); err != nil {
 			validationErrs.Add(err)
-			numInvalidAlerts.Inc()
+			api.m.Invalid().Inc()
 			continue
 		}
 		validAlerts = append(validAlerts, a)
@@ -556,7 +537,7 @@ func (api *API) setSilence(w http.ResponseWriter, r *http.Request) {
 func (api *API) getSilence(w http.ResponseWriter, r *http.Request) {
 	sid := route.Param(r.Context(), "sid")
 
-	sils, err := api.silences.Query(silence.QIDs(sid))
+	sils, _, err := api.silences.Query(silence.QIDs(sid))
 	if err != nil || len(sils) == 0 {
 		http.Error(w, fmt.Sprint("Error getting silence: ", err), http.StatusNotFound)
 		return
@@ -587,7 +568,7 @@ func (api *API) delSilence(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
-	psils, err := api.silences.Query()
+	psils, _, err := api.silences.Query()
 	if err != nil {
 		api.respondError(w, apiError{
 			typ: errorInternal,

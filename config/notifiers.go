@@ -15,8 +15,11 @@ package config
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/pkg/errors"
 
 	commoncfg "github.com/prometheus/common/config"
 )
@@ -105,12 +108,11 @@ var (
 		NotifierConfig: NotifierConfig{
 			VSendResolved: false,
 		},
-		Message:   `{{ template "wechat.default.message" . }}`,
-		APISecret: `{{ template "wechat.default.api_secret" . }}`,
-		ToUser:    `{{ template "wechat.default.to_user" . }}`,
-		ToParty:   `{{ template "wechat.default.to_party" . }}`,
-		ToTag:     `{{ template "wechat.default.to_tag" . }}`,
-		AgentID:   `{{ template "wechat.default.agent_id" . }}`,
+		Message: `{{ template "wechat.default.message" . }}`,
+		ToUser:  `{{ template "wechat.default.to_user" . }}`,
+		ToParty: `{{ template "wechat.default.to_party" . }}`,
+		ToTag:   `{{ template "wechat.default.to_tag" . }}`,
+		AgentID: `{{ template "wechat.default.agent_id" . }}`,
 	}
 
 	// DefaultVictorOpsConfig defines default values for VictorOps configurations.
@@ -135,6 +137,7 @@ var (
 		Priority: `{{ if eq .Status "firing" }}2{{ else }}0{{ end }}`, // emergency (firing) or normal
 		Retry:    duration(1 * time.Minute),
 		Expire:   duration(1 * time.Hour),
+		HTML:     false,
 	}
 
 	// DefaultDingtalkConfig defines default values for Dingtalk configurations.
@@ -229,7 +232,7 @@ type PagerdutyLink struct {
 type PagerdutyImage struct {
 	Src  string `yaml:"src,omitempty" json:"src,omitempty"`
 	Alt  string `yaml:"alt,omitempty" json:"alt,omitempty"`
-	Text string `yaml:"text,omitempty" json:"text,omitempty"`
+	Href string `yaml:"href,omitempty" json:"href,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -450,16 +453,7 @@ type WechatConfig struct {
 func (c *WechatConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	*c = DefaultWechatConfig
 	type plain WechatConfig
-	if err := unmarshal((*plain)(c)); err != nil {
-		return err
-	}
-	if c.APISecret == "" {
-		return fmt.Errorf("missing Wechat APISecret in Wechat config")
-	}
-	if c.CorpID == "" {
-		return fmt.Errorf("missing Wechat CorpID in Wechat config")
-	}
-	return nil
+	return unmarshal((*plain)(c))
 }
 
 // OpsGenieConfig configures notifications via OpsGenie.
@@ -468,23 +462,52 @@ type OpsGenieConfig struct {
 
 	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
 
-	APIKey      Secret            `yaml:"api_key,omitempty" json:"api_key,omitempty"`
-	APIURL      *URL              `yaml:"api_url,omitempty" json:"api_url,omitempty"`
-	Message     string            `yaml:"message,omitempty" json:"message,omitempty"`
-	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
-	Source      string            `yaml:"source,omitempty" json:"source,omitempty"`
-	Details     map[string]string `yaml:"details,omitempty" json:"details,omitempty"`
-	Teams       string            `yaml:"teams,omitempty" json:"teams,omitempty"`
-	Tags        string            `yaml:"tags,omitempty" json:"tags,omitempty"`
-	Note        string            `yaml:"note,omitempty" json:"note,omitempty"`
-	Priority    string            `yaml:"priority,omitempty" json:"priority,omitempty"`
+	APIKey      Secret                    `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	APIURL      *URL                      `yaml:"api_url,omitempty" json:"api_url,omitempty"`
+	Message     string                    `yaml:"message,omitempty" json:"message,omitempty"`
+	Description string                    `yaml:"description,omitempty" json:"description,omitempty"`
+	Source      string                    `yaml:"source,omitempty" json:"source,omitempty"`
+	Details     map[string]string         `yaml:"details,omitempty" json:"details,omitempty"`
+	Responders  []OpsGenieConfigResponder `yaml:"responders,omitempty" json:"responders,omitempty"`
+	Tags        string                    `yaml:"tags,omitempty" json:"tags,omitempty"`
+	Note        string                    `yaml:"note,omitempty" json:"note,omitempty"`
+	Priority    string                    `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
+
+const opsgenieValidTypesRe = `^(team|user|escalation|schedule)$`
+
+var opsgenieTypeMatcher = regexp.MustCompile(opsgenieValidTypesRe)
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *OpsGenieConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	*c = DefaultOpsGenieConfig
 	type plain OpsGenieConfig
-	return unmarshal((*plain)(c))
+	if err := unmarshal((*plain)(c)); err != nil {
+		return err
+	}
+
+	for _, r := range c.Responders {
+		if r.ID == "" && r.Username == "" && r.Name == "" {
+			return errors.Errorf("OpsGenieConfig responder %v has to have at least one of id, username or name specified", r)
+		}
+
+		r.Type = strings.ToLower(r.Type)
+		if !opsgenieTypeMatcher.MatchString(r.Type) {
+			return errors.Errorf("OpsGenieConfig responder %v type does not match valid options %s", r, opsgenieValidTypesRe)
+		}
+	}
+
+	return nil
+}
+
+type OpsGenieConfigResponder struct {
+	// One of those 3 should be filled.
+	ID       string `yaml:"id,omitempty" json:"id,omitempty"`
+	Name     string `yaml:"name,omitempty" json:"name,omitempty"`
+	Username string `yaml:"username,omitempty" json:"username,omitempty"`
+
+	// team, user, escalation, schedule etc.
+	Type string `yaml:"type,omitempty" json:"type,omitempty"`
 }
 
 // VictorOpsConfig configures notifications via VictorOps.
@@ -493,13 +516,14 @@ type VictorOpsConfig struct {
 
 	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
 
-	APIKey            Secret `yaml:"api_key" json:"api_key"`
-	APIURL            *URL   `yaml:"api_url" json:"api_url"`
-	RoutingKey        string `yaml:"routing_key" json:"routing_key"`
-	MessageType       string `yaml:"message_type" json:"message_type"`
-	StateMessage      string `yaml:"state_message" json:"state_message"`
-	EntityDisplayName string `yaml:"entity_display_name" json:"entity_display_name"`
-	MonitoringTool    string `yaml:"monitoring_tool" json:"monitoring_tool"`
+	APIKey            Secret            `yaml:"api_key" json:"api_key"`
+	APIURL            *URL              `yaml:"api_url" json:"api_url"`
+	RoutingKey        string            `yaml:"routing_key" json:"routing_key"`
+	MessageType       string            `yaml:"message_type" json:"message_type"`
+	StateMessage      string            `yaml:"state_message" json:"state_message"`
+	EntityDisplayName string            `yaml:"entity_display_name" json:"entity_display_name"`
+	MonitoringTool    string            `yaml:"monitoring_tool" json:"monitoring_tool"`
+	CustomFields      map[string]string `yaml:"custom_fields,omitempty" json:"custom_fields,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -512,6 +536,15 @@ func (c *VictorOpsConfig) UnmarshalYAML(unmarshal func(interface{}) error) error
 	if c.RoutingKey == "" {
 		return fmt.Errorf("missing Routing key in VictorOps config")
 	}
+
+	reservedFields := []string{"routing_key", "message_type", "state_message", "entity_display_name", "monitoring_tool", "entity_id", "entity_state"}
+
+	for _, v := range reservedFields {
+		if _, ok := c.CustomFields[v]; ok {
+			return fmt.Errorf("VictorOps config contains custom field %s which cannot be used as it conflicts with the fixed/static fields", v)
+		}
+	}
+
 	return nil
 }
 
@@ -539,9 +572,12 @@ type PushoverConfig struct {
 	Title    string   `yaml:"title,omitempty" json:"title,omitempty"`
 	Message  string   `yaml:"message,omitempty" json:"message,omitempty"`
 	URL      string   `yaml:"url,omitempty" json:"url,omitempty"`
+	URLTitle string   `yaml:"url_title,omitempty" json:"url_title,omitempty"`
+	Sound    string   `yaml:"sound,omitempty" json:"sound,omitempty"`
 	Priority string   `yaml:"priority,omitempty" json:"priority,omitempty"`
 	Retry    duration `yaml:"retry,omitempty" json:"retry,omitempty"`
 	Expire   duration `yaml:"expire,omitempty" json:"expire,omitempty"`
+	HTML     bool     `yaml:"html,omitempty" json:"html,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.

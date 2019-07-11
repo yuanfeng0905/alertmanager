@@ -20,16 +20,15 @@ import (
 
 	"github.com/xlab/treeprint"
 
-	"github.com/prometheus/alertmanager/client"
+	"github.com/prometheus/alertmanager/api/v2/models"
 	"github.com/prometheus/alertmanager/dispatch"
-	"gopkg.in/alecthomas/kingpin.v2"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 type routingShow struct {
 	configFile        string
 	labels            []string
 	expectedReceivers string
-	tree              treeprint.Tree
 	debugTree         bool
 }
 
@@ -62,7 +61,7 @@ func configureRoutingCmd(app *kingpin.CmdClause) {
 }
 
 func (c *routingShow) routingShowAction(ctx context.Context, _ *kingpin.ParseContext) error {
-	// Load configuration form file or URL.
+	// Load configuration from file or URL.
 	cfg, err := loadAlertmanagerConfig(ctx, alertmanagerURL, c.configFile)
 	if err != nil {
 		kingpin.Fatalf("%s", err)
@@ -102,19 +101,19 @@ func convertRouteToTree(route *dispatch.Route, tree treeprint.Tree) {
 	}
 }
 
-func getMatchingTree(route *dispatch.Route, tree treeprint.Tree, lset client.LabelSet) {
+func getMatchingTree(route *dispatch.Route, tree treeprint.Tree, lset models.LabelSet) {
 	final := true
 	branch := tree.AddBranch(getRouteTreeSlug(route, false, false))
 	for _, r := range route.Routes {
-		if r.Matchers.Match(convertClientToCommonLabelSet(lset)) == true {
+		if r.Matchers.Match(convertClientToCommonLabelSet(lset)) {
 			getMatchingTree(r, branch, lset)
 			final = false
-			if r.Continue != true {
+			if !r.Continue {
 				break
 			}
 		}
 	}
-	if final == true {
+	if final {
 		branch.SetValue(getRouteTreeSlug(route, false, true))
 	}
 }

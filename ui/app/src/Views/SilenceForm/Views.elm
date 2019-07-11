@@ -1,14 +1,13 @@
 module Views.SilenceForm.Views exposing (view)
 
-import Alerts.Types exposing (Alert)
-import Data.Silence exposing (Silence)
+import Data.GettableAlert exposing (GettableAlert)
 import Html exposing (Html, a, button, div, fieldset, h1, input, label, legend, span, strong, text, textarea)
 import Html.Attributes exposing (class, href)
 import Html.Events exposing (onClick)
 import Utils.Filter
 import Utils.FormValidation exposing (ValidatedField, ValidationState(..))
 import Utils.Types exposing (ApiData)
-import Utils.Views exposing (checkbox, iconButtonMsg, loading, validatedField)
+import Utils.Views exposing (checkbox, iconButtonMsg, loading, validatedField, validatedTextareaField)
 import Views.Shared.SilencePreview
 import Views.Shared.Types exposing (Msg)
 import Views.SilenceForm.Types exposing (MatcherForm, Model, SilenceForm, SilenceFormFieldMsg(..), SilenceFormMsg(..))
@@ -35,7 +34,7 @@ view maybeId matchers defaultCreator { form, silenceId, alerts, activeAlertId } 
             (UpdateCreatedBy >> UpdateField)
             (ValidateCreatedBy |> UpdateField)
             form.createdBy
-        , validatedField textarea
+        , validatedTextareaField
             "Comment"
             inputSectionPadding
             (UpdateComment >> UpdateField)
@@ -95,7 +94,7 @@ matcherInput matchers =
         ]
 
 
-informationBlock : Maybe String -> ApiData String -> ApiData (List Alert) -> Html SilenceFormMsg
+informationBlock : Maybe String -> ApiData String -> ApiData (List GettableAlert) -> Html SilenceFormMsg
 informationBlock activeAlertId silence alerts =
     case silence of
         Utils.Types.Success _ ->
