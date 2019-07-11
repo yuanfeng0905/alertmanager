@@ -232,7 +232,7 @@ type PagerdutyLink struct {
 type PagerdutyImage struct {
 	Src  string `yaml:"src,omitempty" json:"src,omitempty"`
 	Alt  string `yaml:"alt,omitempty" json:"alt,omitempty"`
-	Text string `yaml:"text,omitempty" json:"text,omitempty"`
+	Href string `yaml:"href,omitempty" json:"href,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -474,7 +474,7 @@ type OpsGenieConfig struct {
 	Priority    string                    `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
 
-const opsgenieValidTypesRe = `^team|user|escalation|schedule$`
+const opsgenieValidTypesRe = `^(team|user|escalation|schedule)$`
 
 var opsgenieTypeMatcher = regexp.MustCompile(opsgenieValidTypesRe)
 
